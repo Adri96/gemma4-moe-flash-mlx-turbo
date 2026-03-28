@@ -6,6 +6,7 @@ use mlx_rs::Array;
 
 use crate::memory::ExpertMemoryManager;
 use crate::model::Model;
+use crate::perf::PerfStats;
 use crate::tokenizer::QwenTokenizer;
 
 pub fn generate(
@@ -17,6 +18,7 @@ pub fn generate(
     top_p: f32,
     mem: &ExpertMemoryManager,
 ) -> anyhow::Result<String> {
+    let perf = PerfStats::new();
     let input_ids = tokenizer.encode(prompt);
     let mut cache = model.make_cache();
 
@@ -27,7 +29,7 @@ pub fn generate(
         &input_ids.iter().map(|&x| x as i32).collect::<Vec<_>>(),
         &[1, input_ids.len() as i32],
     );
-    let logits = model.forward(&input, &mut cache, mem)?;
+    let logits = model.forward(&input, &mut cache, mem, &perf)?;
     mlx_rs::transforms::eval(std::iter::once(&logits))?;
     let prefill_time = t0.elapsed();
     eprintln!(
@@ -51,6 +53,9 @@ pub fn generate(
     print!("{}", text);
     stdout.flush().ok();
 
+    // Reset perf stats and cache stats for decode-only measurement
+    perf.reset();
+    mem.reset_cache_stats();
     let t_start = Instant::now();
     let mut tokens_generated = 1usize;
     let mut prev_text_len = text.len();
@@ -63,7 +68,7 @@ pub fn generate(
         }
 
         let input = Array::from_slice(&[tok_id as i32], &[1, 1]);
-        let logits = model.forward(&input, &mut cache, mem)?;
+        let logits = model.forward(&input, &mut cache, mem, &perf)?;
         let logits = mlx_rs::ops::squeeze_axes(&logits, &[1])?;
         next_token = sample(&logits, temperature, top_p)?;
         mlx_rs::transforms::eval(std::iter::once(&next_token))?;
@@ -105,6 +110,17 @@ pub fn generate(
             rate * 100.0, hits, hits + misses
         );
     }
+
+    let (ch, cm, cr) = mem.take_cache_stats();
+    if ch + cm > 0 {
+        eprintln!(
+            "Expert cache hit rate: {:.1}% ({}/{} lookups, cache size {})",
+            cr * 100.0, ch, ch + cm,
+            mem.cache_size(),
+        );
+    }
+
+    perf.report(tokens_generated);
 
     Ok(tokenizer.decode(&generated))
 }

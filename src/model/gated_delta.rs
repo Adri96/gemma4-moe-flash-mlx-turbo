@@ -1,9 +1,12 @@
+use std::time::Instant;
+
 use mlx_rs::error::Exception;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::ArraysCache;
 use crate::model::mlp::QuantizedLinear;
 use crate::model::norm::RMSNormGated;
+use crate::perf::PerfStats;
 
 /// GatedDeltaNet — linear attention (30 of 40 layers).
 /// Uses ops-based fallback (Path B) for the recurrent update.
@@ -33,6 +36,7 @@ impl GatedDeltaNet {
         x: &Array,
         mask: Option<&Array>,
         cache: &mut ArraysCache,
+        perf: &PerfStats,
     ) -> Result<Array, Exception> {
         let b = x.dim(0);
         let s = x.dim(1);
@@ -92,7 +96,9 @@ impl GatedDeltaNet {
         let g = compute_g(&self.a_log, &a_proj, &self.dt_bias)?;
 
         // Eval inputs before sequential recurrent loop
+        let _t = Instant::now();
         mlx_rs::transforms::eval([&q, &k, &v, &beta, &g])?;
+        perf.acc(&perf.gdn_proj_eval, _t.elapsed());
         // 6. Recurrent update (Path B)
         let state = cache.get(1).cloned();
         let (out, new_state) = gated_delta_ops(&q, &k, &v, &g, &beta, state.as_ref(), mask)?;

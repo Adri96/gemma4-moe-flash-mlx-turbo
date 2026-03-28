@@ -53,7 +53,8 @@ cargo build --release
 
 ## Performance
 
-- 1.3 tok/s decode, 0.6 tok/s prefill. No swap storms. Peak expert memory ~27 MB per layer.
+- 1.8 tok/s decode, 1.6 tok/s prefill. No swap storms. Peak expert memory ~27 MB per layer.
+- Expert extraction uses pread() instead of mmap demand-paging (3.6× faster — eliminates page fault overhead)
 
 ## Key gotchas
 

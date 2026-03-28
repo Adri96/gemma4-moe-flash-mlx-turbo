@@ -4,6 +4,7 @@ mod engine;
 mod ffi;
 mod memory;
 mod model;
+mod perf;
 mod splitter;
 mod tokenizer;
 

@@ -6,6 +6,7 @@ pub mod norm;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use mlx_rs::error::Exception;
 use mlx_rs::Array;
@@ -13,6 +14,7 @@ use mlx_rs::Array;
 use crate::cache::{ArraysCache, Cache, KVCache};
 use crate::config::TextModelArgs;
 use crate::memory::ExpertMemoryManager;
+use crate::perf::PerfStats;
 use attention::Attention;
 use gated_delta::GatedDeltaNet;
 use mlp::{QuantizedLinear, MLP};
@@ -42,11 +44,12 @@ impl DecoderLayer {
         mask: Option<&Array>,
         cache: &mut Cache,
         mem: &ExpertMemoryManager,
+        perf: &PerfStats,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = match &mut self.attention {
             AttentionLayer::Linear(gdn) => {
-                gdn.forward(&normed, mask, cache.as_arrays_mut())?
+                gdn.forward(&normed, mask, cache.as_arrays_mut(), perf)?
             }
             AttentionLayer::Full(attn) => {
                 attn.forward(&normed, mask, cache.as_kv_mut())?
@@ -54,7 +57,7 @@ impl DecoderLayer {
         };
         let h = x + &attn_out;
         let normed = self.post_attention_layernorm.forward(&h)?;
-        let mlp_out = self.mlp.forward(&normed, mem)?;
+        let mlp_out = self.mlp.forward(&normed, mem, perf)?;
         Ok(&h + &mlp_out)
     }
 }
@@ -76,6 +79,7 @@ impl TextModel {
         input_ids: &Array,
         cache: &mut [Cache],
         mem: &ExpertMemoryManager,
+        perf: &PerfStats,
     ) -> Result<Array, Exception> {
         let flat_ids = input_ids.flatten(None, None)?;
         let w = mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?;
@@ -98,8 +102,10 @@ impl TextModel {
             } else {
                 fa_mask.as_ref()
             };
-            h = layer.forward(&h, mask, c, mem)?;
+            h = layer.forward(&h, mask, c, mem, perf)?;
+            let _t = Instant::now();
             mlx_rs::transforms::eval(std::iter::once(&h))?;
+            perf.acc(&perf.layer_eval, _t.elapsed());
         }
 
         self.norm.forward(&h)
@@ -118,8 +124,9 @@ impl Model {
         input_ids: &Array,
         cache: &mut [Cache],
         mem: &ExpertMemoryManager,
+        perf: &PerfStats,
     ) -> Result<Array, Exception> {
-        let out = self.model.forward(input_ids, cache, mem)?;
+        let out = self.model.forward(input_ids, cache, mem, perf)?;
         if self.tie_word_embeddings {
             mlx_rs::ops::quantized_matmul(
                 &out,

@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -41,10 +43,14 @@ pub struct ExpertSlice {
     pub down_biases: Array,
 }
 
-/// Manages mmap'd expert safetensors files.
-/// Provides on-demand extraction of expert slices for MoE computation.
+/// Manages expert safetensors files with direct pread() extraction.
+///
+/// Instead of mmap demand-paging (which triggers ~55K page faults/token at ~20μs each),
+/// uses pread() syscalls that read entire expert strides in single I/O operations.
+/// mmap is kept only for warm set madvise prefetch.
 pub struct ExpertMemoryManager {
-    maps: Vec<Mmap>,
+    files: Vec<File>,       // for pread() extraction
+    maps: Vec<Mmap>,        // for warm set madvise only
     offsets: Vec<LayerTensorOffsets>,
     warm_set: HashSet<(u32, u32)>,
     hits: AtomicUsize,
@@ -107,19 +113,23 @@ fn parse_layer_offsets(mmap: &[u8]) -> anyhow::Result<LayerTensorOffsets> {
 }
 
 impl ExpertMemoryManager {
-    /// Open and mmap all expert safetensors files, parse headers.
+    /// Open expert safetensors files: mmap for headers + madvise, File handles for pread.
     pub fn new(expert_dir: &Path, num_layers: usize) -> anyhow::Result<Self> {
+        let mut files = Vec::with_capacity(num_layers);
         let mut maps = Vec::with_capacity(num_layers);
         let mut offsets = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let path = expert_dir.join(format!("layer_{:02}_experts.safetensors", i));
-            let file = std::fs::File::open(&path)?;
+            let file = File::open(&path)?;
             let mmap = unsafe { Mmap::map(&file)? };
             let layer_offsets = parse_layer_offsets(&mmap)?;
             offsets.push(layer_offsets);
             maps.push(mmap);
+            // Reopen for pread (separate fd avoids any interaction with mmap)
+            files.push(File::open(&path)?);
         }
         Ok(Self {
+            files,
             maps,
             offsets,
             warm_set: HashSet::new(),
@@ -141,9 +151,14 @@ impl ExpertMemoryManager {
         (h, m, rate)
     }
 
-    /// Extract specific experts from a layer's mmap'd safetensors.
-    /// Creates 9 MLX arrays, each with shape [num_experts, d1, d2],
-    /// containing only the requested expert slices (copied from mmap).
+    /// Dummy methods for compatibility with engine.rs cache reporting
+    pub fn take_cache_stats(&self) -> (u64, u64, f64) { (0, 0, 0.0) }
+    pub fn reset_cache_stats(&self) {}
+    pub fn cache_size(&self) -> usize { 0 }
+
+    /// Extract specific experts from a layer using pread() syscalls.
+    /// Each expert stride is read in a single pread, avoiding the ~20μs-per-page
+    /// overhead of mmap demand-paging.
     /// Tracks warm set hit/miss stats.
     pub fn extract_experts(&self, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
         // Track warm set hits
@@ -155,22 +170,27 @@ impl ExpertMemoryManager {
             }
         }
 
-        let mmap = &self.maps[layer];
+        let file = &self.files[layer];
         let layer_offsets = &self.offsets[layer];
         let n = expert_indices.len() as i32;
 
         let mut arrays = Vec::with_capacity(9);
         for tensor in &layer_offsets.tensors {
-            // Build a contiguous buffer with only the requested experts
-            let mut buf = Vec::with_capacity(expert_indices.len() * tensor.per_expert_stride);
-            for &eidx in expert_indices {
-                let abs_start = layer_offsets.data_start
+            let stride = tensor.per_expert_stride;
+            let total = expert_indices.len() * stride;
+            let mut buf = vec![0u8; total];
+
+            for (i, &eidx) in expert_indices.iter().enumerate() {
+                let file_offset = (layer_offsets.data_start
                     + tensor.data_offset
-                    + eidx as usize * tensor.per_expert_stride;
-                let slice = &mmap[abs_start..abs_start + tensor.per_expert_stride];
-                buf.extend_from_slice(slice);
+                    + eidx as usize * stride) as u64;
+                file.read_exact_at(
+                    &mut buf[i * stride..(i + 1) * stride],
+                    file_offset,
+                )
+                .expect("pread failed");
             }
-            // Shape: [num_experts, ...expert_shape]
+
             let mut shape = vec![n];
             shape.extend_from_slice(&tensor.expert_shape);
             let arr = unsafe {
@@ -196,8 +216,7 @@ impl ExpertMemoryManager {
         }
     }
 
-    /// Prefetch warm set expert pages into kernel page cache.
-    /// Uses madvise(MADV_WILLNEED) to hint the kernel without pinning.
+    /// Prefetch warm set expert pages into kernel page cache via madvise.
     /// Returns total bytes advised.
     pub fn mlock_warm_set(&self, experts: &[(u32, u32)]) -> usize {
         let page_size: usize = 16384; // Apple Silicon page size

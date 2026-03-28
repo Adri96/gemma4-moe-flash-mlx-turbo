@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use mlx_rs::error::Exception;
 use mlx_rs::Array;
@@ -6,6 +7,7 @@ use mlx_rs::Array;
 use crate::ffi;
 use crate::memory::ExpertMemoryManager;
 use crate::model::mlp::{QuantizedLinear, MLP};
+use crate::perf::PerfStats;
 
 /// UMA-native sparse MoE block.
 /// Expert weights are loaded on-demand from mmap'd safetensors (not held in memory).
@@ -21,7 +23,7 @@ pub struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    pub fn forward(&self, x: &Array, mem: &ExpertMemoryManager) -> Result<Array, Exception> {
+    pub fn forward(&self, x: &Array, mem: &ExpertMemoryManager, perf: &PerfStats) -> Result<Array, Exception> {
         let k = self.top_k as i32;
 
         // 1. Router
@@ -47,21 +49,30 @@ impl SparseMoeBlock {
         let shared_y = &shared_gate * &shared_y;
 
         // 3. Eval routing indices → read to CPU for on-demand expert loading
+        let _t = Instant::now();
         mlx_rs::transforms::eval(std::iter::once(&inds))?;
+        perf.acc(&perf.moe_routing_eval, _t.elapsed());
+
         let flat_idx = inds.reshape(&[-1])?;
+        let _t = Instant::now();
         mlx_rs::transforms::eval(std::iter::once(&flat_idx))?;
+        perf.acc(&perf.moe_flat_eval, _t.elapsed());
         let flat_data: &[i32] = flat_idx.as_slice();
 
         // Find unique expert indices and build remap table
+        let _t = Instant::now();
         let mut unique: Vec<i32> = flat_data.to_vec();
         unique.sort();
         unique.dedup();
         let remap: HashMap<i32, i32> = unique.iter().enumerate()
             .map(|(i, &orig)| (orig, i as i32))
             .collect();
+        perf.acc(&perf.routing_cpu, _t.elapsed());
 
         // 4. Extract only the needed experts from mmap (~27 MB for 8 experts)
+        let _t = Instant::now();
         let experts = mem.extract_experts(self.layer_idx, &unique);
+        perf.acc(&perf.extract_experts, _t.elapsed());
 
         // 5. Remap flat indices from [0-255] to [0-num_unique)
         let remapped: Vec<i32> = flat_data.iter().map(|&idx| remap[&idx]).collect();
@@ -76,7 +87,9 @@ impl SparseMoeBlock {
         let x_sorted = mlx_rs::ops::indexing::take_axis(&x_flat, &div_k, 0)?;
         let idx_sorted = mlx_rs::ops::indexing::take_axis(&remapped_idx, &order, 0)?;
 
+        let _t = Instant::now();
         mlx_rs::transforms::eval([&x_sorted, &idx_sorted])?;
+        perf.acc(&perf.moe_sort_eval, _t.elapsed());
 
         // 7. gather_qmm triad on compact expert arrays
         let x_gate = ffi::gather_qmm(
