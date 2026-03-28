@@ -95,10 +95,14 @@ impl GatedDeltaNet {
         let beta = mlx_rs::ops::sigmoid(&b_proj)?;
         let g = compute_g(&self.a_log, &a_proj, &self.dt_bias)?;
 
-        // Eval inputs before sequential recurrent loop
-        let _t = Instant::now();
-        mlx_rs::transforms::eval([&q, &k, &v, &beta, &g])?;
-        perf.acc(&perf.gdn_proj_eval, _t.elapsed());
+        // Eval inputs before sequential recurrent loop (prefill only).
+        // During decode (s=1), the single-iteration loop creates a trivial lazy graph
+        // that can be materialized later, saving ~0.7ms sync overhead per layer.
+        if s > 1 {
+            let _t = Instant::now();
+            mlx_rs::transforms::eval([&q, &k, &v, &beta, &g])?;
+            perf.acc(&perf.gdn_proj_eval, _t.elapsed());
+        }
         // 6. Recurrent update (Path B)
         let state = cache.get(1).cloned();
         let (out, new_state) = gated_delta_ops(&q, &k, &v, &g, &beta, state.as_ref(), mask)?;

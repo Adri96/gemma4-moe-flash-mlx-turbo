@@ -5,14 +5,13 @@ use std::time::Duration;
 /// All values in nanoseconds. Single-threaded (Cell, not Atomic).
 pub struct PerfStats {
     // Eval barriers — where GPU actually syncs
-    pub gdn_proj_eval: Cell<u64>,     // eval([q,k,v,beta,g]) — GDN projections (30/tok)
-    pub moe_routing_eval: Cell<u64>,  // eval(inds) — routing + attn tail (40/tok)
-    pub moe_flat_eval: Cell<u64>,     // eval(flat_idx) — reshape (40/tok, likely trivial)
+    pub gdn_proj_eval: Cell<u64>,     // eval([q,k,v,beta,g]) — prefill only (0 during decode)
+    pub moe_routing_eval: Cell<u64>,  // eval(flat_idx) — routing + attn tail (40/tok)
     pub moe_sort_eval: Cell<u64>,     // eval([x_sorted,idx_sorted]) — argsort boundary (40/tok)
     pub layer_eval: Cell<u64>,        // eval(h) — gather_qmm + shared expert (40/tok)
 
     // CPU work between evals
-    pub extract_experts: Cell<u64>,   // mmap I/O + Vec copy + from_raw_data (40/tok)
+    pub extract_experts: Cell<u64>,   // pread I/O + from_raw_data (40/tok)
     pub routing_cpu: Cell<u64>,       // unique/sort/dedup/HashMap/remap (40/tok)
 }
 
@@ -21,7 +20,6 @@ impl PerfStats {
         Self {
             gdn_proj_eval: Cell::new(0),
             moe_routing_eval: Cell::new(0),
-            moe_flat_eval: Cell::new(0),
             moe_sort_eval: Cell::new(0),
             layer_eval: Cell::new(0),
             extract_experts: Cell::new(0),
@@ -36,7 +34,6 @@ impl PerfStats {
     pub fn reset(&self) {
         self.gdn_proj_eval.set(0);
         self.moe_routing_eval.set(0);
-        self.moe_flat_eval.set(0);
         self.moe_sort_eval.set(0);
         self.layer_eval.set(0);
         self.extract_experts.set(0);
@@ -49,7 +46,6 @@ impl PerfStats {
 
         let evals_total = self.gdn_proj_eval.get()
             + self.moe_routing_eval.get()
-            + self.moe_flat_eval.get()
             + self.moe_sort_eval.get()
             + self.layer_eval.get();
         let cpu_total = self.extract_experts.get() + self.routing_cpu.get();
@@ -60,12 +56,12 @@ impl PerfStats {
         eprintln!("\n=== Perf Breakdown ({} decode tokens) ===", num_tokens);
         eprintln!("Phase                    Total ms   ms/tok    %");
         eprintln!("─────────────────────────────────────────────────");
-        eprintln!("GDN proj eval (×30):   {:>8.1}   {:>6.1}   {:>4.1}%",
-            ms(self.gdn_proj_eval.get()), per_tok(self.gdn_proj_eval.get()), pct(self.gdn_proj_eval.get()));
+        if self.gdn_proj_eval.get() > 0 {
+            eprintln!("GDN proj eval:         {:>8.1}   {:>6.1}   {:>4.1}%",
+                ms(self.gdn_proj_eval.get()), per_tok(self.gdn_proj_eval.get()), pct(self.gdn_proj_eval.get()));
+        }
         eprintln!("MoE routing eval (×40):{:>8.1}   {:>6.1}   {:>4.1}%",
             ms(self.moe_routing_eval.get()), per_tok(self.moe_routing_eval.get()), pct(self.moe_routing_eval.get()));
-        eprintln!("MoE flat eval (×40):   {:>8.1}   {:>6.1}   {:>4.1}%",
-            ms(self.moe_flat_eval.get()), per_tok(self.moe_flat_eval.get()), pct(self.moe_flat_eval.get()));
         eprintln!("MoE sort eval (×40):   {:>8.1}   {:>6.1}   {:>4.1}%",
             ms(self.moe_sort_eval.get()), per_tok(self.moe_sort_eval.get()), pct(self.moe_sort_eval.get()));
         eprintln!("Layer eval (×40):      {:>8.1}   {:>6.1}   {:>4.1}%",

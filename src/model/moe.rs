@@ -48,15 +48,13 @@ impl SparseMoeBlock {
         let shared_gate = mlx_rs::ops::sigmoid(&self.shared_expert_gate.forward(x)?)?;
         let shared_y = &shared_gate * &shared_y;
 
-        // 3. Eval routing indices → read to CPU for on-demand expert loading
-        let _t = Instant::now();
-        mlx_rs::transforms::eval(std::iter::once(&inds))?;
-        perf.acc(&perf.moe_routing_eval, _t.elapsed());
-
+        // 3. Eval routing indices → read to CPU for on-demand expert loading.
+        // Single eval materializes the entire routing chain (gate + softmax + argpartition)
+        // plus any pending lazy work from attention (GDN recurrent tail during decode).
         let flat_idx = inds.reshape(&[-1])?;
         let _t = Instant::now();
         mlx_rs::transforms::eval(std::iter::once(&flat_idx))?;
-        perf.acc(&perf.moe_flat_eval, _t.elapsed());
+        perf.acc(&perf.moe_routing_eval, _t.elapsed());
         let flat_data: &[i32] = flat_idx.as_slice();
 
         // Find unique expert indices and build remap table
