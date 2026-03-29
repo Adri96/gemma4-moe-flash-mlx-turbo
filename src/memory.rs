@@ -460,6 +460,10 @@ impl ExpertMemoryManager {
         }
     }
 
+    /// Block until the I/O thread finishes the current prefetch request.
+    /// Call after graph build, before eval — ensures all expert pages are in
+    /// the page cache so the GPU runs fault-free. The GPU is better off idle
+    /// for ~3ms than faulting at 38% SSD efficiency for ~4.7ms.
     #[allow(dead_code)]
     pub fn wait_for_prefetch(&self) {
         if let Some(rx) = &self.io_done_rx {
@@ -661,6 +665,7 @@ impl ExpertMemoryManager {
     }
 
     /// Issue F_RDADVISE for specific experts at a given layer.
+    /// Used by the predictor for cross-token prefetch.
     #[allow(dead_code)]
     pub fn prefetch_experts(&self, layer: usize, expert_indices: &[i32]) {
         if layer >= self.files.len() {
@@ -689,6 +694,8 @@ impl ExpertMemoryManager {
         }
     }
 
+    /// Prefetch current-layer expert pages via madvise(MADV_WILLNEED).
+    /// Call right after routing eval to give the kernel a head start before GPU access.
     #[allow(dead_code)]
     pub fn prefetch_experts_madvise(&self, layer: usize, expert_indices: &[i32]) {
         if layer >= self.maps.len() {
@@ -723,6 +730,8 @@ impl ExpertMemoryManager {
     /// Eliminates page faults entirely: explicit I/O at high NVMe queue depth
     /// (one pread per expert in parallel via rayon) followed by zero-copy GPU access.
     ///
+    /// Safety: the hybrid buffer is reused across layers. Per-layer eval barriers
+    /// in model forward guarantee previous data is consumed before overwrite.
     #[allow(dead_code)]
     pub fn extract_experts_hybrid(&self, layer: usize, expert_indices: &[i32]) -> Vec<SingleExpertTensors> {
         let info = match &self.format {

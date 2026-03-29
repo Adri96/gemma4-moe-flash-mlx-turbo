@@ -1,12 +1,8 @@
 use mlx_rs::error::Exception;
 use mlx_rs::Array;
 
-// ============================================================
-// TurboQuant support: Randomized Hadamard Transform + Lloyd-Max
-// ============================================================
-
 /// Generate normalized Hadamard matrix H_n (Sylvester construction).
-/// H * H^T = I for the normalized version. n must be a power of 2.
+/// H * H^T = I. n must be a power of 2.
 fn generate_hadamard(n: usize) -> Vec<f32> {
     let mut h = vec![0.0f32; n * n];
     h[0] = 1.0;
@@ -92,75 +88,72 @@ fn lloyd_max_codebook(bits: u8) -> (&'static [f32], &'static [f32]) {
     }
 }
 
-/// TurboQuant quantize: normalize → rotate → scale → boundary search.
-/// Input x: [B, H, T, D] in any dtype.
-/// Returns (indices: [B, H, T, D] uint8, norms: [B, H, T, 1] f32).
+/// Quantize: normalize → rotate → scale → boundary search.
+/// Input x: [B, H, T, D]. Returns (indices: [B, H, T, D] uint8, norms: [B, H, T, 1] f32).
 fn turbo_quantize(
     x: &Array,
-    boundaries: &Array,
-    rotation: &Array,
-    sqrt_d: f32,
+    config: &TurboQuantConfig,
 ) -> Result<(Array, Array), Exception> {
     let x = x.as_dtype(mlx_rs::Dtype::Float32)?;
 
-    // L2 norm per vector: [B, H, T, 1]
     let x_sq = &x * &x;
     let sum_sq = mlx_rs::ops::sum_axis(&x_sq, -1, Some(true))?;
     let norm = mlx_rs::ops::sqrt(&sum_sq)?;
 
-    // Normalize (epsilon prevents division by zero)
     let eps = Array::from_f32(1e-8);
-    let safe_norm = &norm + &eps;
-    let x_unit = &x / &safe_norm;
-
-    // Rotate: [B, H, T, D] @ [D, D]
-    let x_rot = mlx_rs::ops::matmul(&x_unit, rotation)?;
+    let x_unit = &x / &(&norm + &eps);
+    let x_rot = mlx_rs::ops::matmul(&x_unit, &config.rotation)?;
 
     // Scale to ~N(0,1) for codebook lookup
-    let scale = Array::from_f32(sqrt_d);
+    let scale = Array::from_f32(config.sqrt_d);
     let x_scaled = &x_rot * &scale;
 
-    // Searchsorted via boundary comparison: sum(x[..., None] >= boundaries, axis=-1)
-    let x_exp = mlx_rs::ops::expand_dims(&x_scaled, -1)?; // [B, H, T, D, 1]
-    let cmp = x_exp.ge(boundaries)?; // [B, H, T, D, num_boundaries]
-    let indices = mlx_rs::ops::sum_axis(&cmp, -1, Some(false))?; // [B, H, T, D]
+    // MLX has no searchsorted — use boundary comparison
+    let x_exp = mlx_rs::ops::expand_dims(&x_scaled, -1)?;
+    let cmp = x_exp.ge(&config.boundaries)?;
+    let indices = mlx_rs::ops::sum_axis(&cmp, -1, Some(false))?;
     let indices = indices.as_dtype(mlx_rs::Dtype::Uint8)?;
 
     Ok((indices, norm))
 }
 
-/// TurboQuant dequantize: lookup → unscale → inverse rotate → scale by norm.
-/// Returns [B, H, T, D] in bf16 to keep SDPA in the fast bf16 compute path.
-/// (Model is 9-bit quantized — bf16 is already more precision than activations carry.)
+/// Dequantize: lookup → unscale → inverse rotate → scale by norm.
+/// Returns [B, H, T, D] in bf16 (9-bit model — bf16 exceeds activation precision).
 fn turbo_dequantize(
     indices: &Array,
     norms: &Array,
-    codebook: &Array,
-    rotation_t: &Array,
-    sqrt_d: f32,
+    config: &TurboQuantConfig,
 ) -> Result<Array, Exception> {
-    // Codebook lookup: flatten → take → reshape
     let idx = indices.as_dtype(mlx_rs::Dtype::Int32)?;
     let shape = indices.shape().to_vec();
     let flat = idx.flatten(None, None)?;
-    let flat_vals = mlx_rs::ops::indexing::take_axis(codebook, &flat, 0)?;
+    let flat_vals = mlx_rs::ops::indexing::take_axis(&config.codebook, &flat, 0)?;
     let vals = flat_vals.reshape(&shape)?;
 
-    // Undo N(0,1) scaling
-    let inv_scale = Array::from_f32(1.0 / sqrt_d);
+    let inv_scale = Array::from_f32(1.0 / config.sqrt_d);
     let x_rot = &vals * &inv_scale;
+    let x_unit = mlx_rs::ops::matmul(&x_rot, &config.rotation_t)?;
 
-    // Inverse rotation: [B, H, T, D] @ [D, D]
-    let x_unit = mlx_rs::ops::matmul(&x_rot, rotation_t)?;
-
-    // Scale by original norm, cast to bf16
     let result = &x_unit * norms;
     result.as_dtype(mlx_rs::Dtype::Bfloat16)
 }
 
-// ============================================================
-// KV Cache
-// ============================================================
+/// Append new array to cached, or return new if no cache yet.
+fn concat_or_init(cached: &Option<Array>, new: Array) -> Result<Array, Exception> {
+    match cached {
+        Some(c) => mlx_rs::ops::concatenate_axis(&[c, &new], 2),
+        None => Ok(new),
+    }
+}
+
+/// Immutable quantization constants shared across all cache entries.
+struct TurboQuantConfig {
+    codebook: Array,
+    boundaries: Array,
+    rotation: Array,
+    rotation_t: Array,
+    sqrt_d: f32,
+}
 
 /// KV cache for full attention layers (10 of 40).
 /// Supports both plain bf16 storage and TurboQuant compression.
@@ -170,27 +163,20 @@ pub struct KVCache {
 }
 
 enum KVCacheInner {
-    /// Standard bf16 key/value storage.
     Plain {
         keys: Option<Array>,
         values: Option<Array>,
     },
-    /// TurboQuant: rotation + Lloyd-Max codebook quantization.
     Quantized {
         key_indices: Option<Array>,
         key_norms: Option<Array>,
         value_indices: Option<Array>,
         value_norms: Option<Array>,
-        codebook: Array,
-        boundaries: Array,
-        rotation: Array,
-        rotation_t: Array,
-        sqrt_d: f32,
+        config: TurboQuantConfig,
     },
 }
 
 impl KVCache {
-    /// Create a plain (unquantized) KV cache.
     pub fn new() -> Self {
         Self {
             inner: KVCacheInner::Plain {
@@ -201,13 +187,9 @@ impl KVCache {
         }
     }
 
-    /// Create a TurboQuant-compressed KV cache.
     pub fn new_quantized(head_dim: usize, bits: u8) -> Self {
         let (centroids, bounds) = lloyd_max_codebook(bits);
-        let codebook = Array::from_slice(centroids, &[centroids.len() as i32]);
-        let boundaries = Array::from_slice(bounds, &[bounds.len() as i32]);
         let (rotation, rotation_t) = build_rht(head_dim);
-        let sqrt_d = (head_dim as f32).sqrt();
 
         Self {
             inner: KVCacheInner::Quantized {
@@ -215,11 +197,13 @@ impl KVCache {
                 key_norms: None,
                 value_indices: None,
                 value_norms: None,
-                codebook,
-                boundaries,
-                rotation,
-                rotation_t,
-                sqrt_d,
+                config: TurboQuantConfig {
+                    codebook: Array::from_slice(centroids, &[centroids.len() as i32]),
+                    boundaries: Array::from_slice(bounds, &[bounds.len() as i32]),
+                    rotation,
+                    rotation_t,
+                    sqrt_d: (head_dim as f32).sqrt(),
+                },
             },
             offset: 0,
         }
@@ -230,8 +214,6 @@ impl KVCache {
     }
 
     /// Store new keys/values and return all cached K/V for SDPA.
-    /// For plain cache: concatenate and return bf16.
-    /// For quantized: quantize new, concatenate indices/norms, dequantize all.
     pub fn update_and_fetch(
         &mut self,
         keys: Array,
@@ -242,14 +224,8 @@ impl KVCache {
                 keys: cached_keys,
                 values: cached_values,
             } => {
-                let (k, v) = match (cached_keys.as_ref(), cached_values.as_ref()) {
-                    (Some(ck), Some(cv)) => {
-                        let k = mlx_rs::ops::concatenate_axis(&[ck, &keys], 2)?;
-                        let v = mlx_rs::ops::concatenate_axis(&[cv, &values], 2)?;
-                        (k, v)
-                    }
-                    _ => (keys, values),
-                };
+                let k = concat_or_init(cached_keys, keys)?;
+                let v = concat_or_init(cached_values, values)?;
                 self.offset = k.dim(2) as usize;
                 *cached_keys = Some(k.clone());
                 *cached_values = Some(v.clone());
@@ -261,33 +237,15 @@ impl KVCache {
                 key_norms,
                 value_indices,
                 value_norms,
-                codebook,
-                boundaries,
-                rotation,
-                rotation_t,
-                sqrt_d,
+                config,
             } => {
-                // Quantize new K/V
-                let (new_ki, new_kn) =
-                    turbo_quantize(&keys, boundaries, rotation, *sqrt_d)?;
-                let (new_vi, new_vn) =
-                    turbo_quantize(&values, boundaries, rotation, *sqrt_d)?;
+                let (new_ki, new_kn) = turbo_quantize(&keys, config)?;
+                let (new_vi, new_vn) = turbo_quantize(&values, config)?;
 
-                // Concatenate with cached quantized data
-                let (ki, kn) = match (key_indices.as_ref(), key_norms.as_ref()) {
-                    (Some(ci), Some(cn)) => (
-                        mlx_rs::ops::concatenate_axis(&[ci, &new_ki], 2)?,
-                        mlx_rs::ops::concatenate_axis(&[cn, &new_kn], 2)?,
-                    ),
-                    _ => (new_ki, new_kn),
-                };
-                let (vi, vn) = match (value_indices.as_ref(), value_norms.as_ref()) {
-                    (Some(ci), Some(cn)) => (
-                        mlx_rs::ops::concatenate_axis(&[ci, &new_vi], 2)?,
-                        mlx_rs::ops::concatenate_axis(&[cn, &new_vn], 2)?,
-                    ),
-                    _ => (new_vi, new_vn),
-                };
+                let ki = concat_or_init(key_indices, new_ki)?;
+                let kn = concat_or_init(key_norms, new_kn)?;
+                let vi = concat_or_init(value_indices, new_vi)?;
+                let vn = concat_or_init(value_norms, new_vn)?;
 
                 self.offset = ki.dim(2) as usize;
                 *key_indices = Some(ki.clone());
@@ -295,19 +253,13 @@ impl KVCache {
                 *value_indices = Some(vi.clone());
                 *value_norms = Some(vn.clone());
 
-                // Dequantize full cache for SDPA (f32 — MLX auto-promotes with bf16 queries)
-                let k = turbo_dequantize(&ki, &kn, codebook, rotation_t, *sqrt_d)?;
-                let v = turbo_dequantize(&vi, &vn, codebook, rotation_t, *sqrt_d)?;
-
+                let k = turbo_dequantize(&ki, &kn, config)?;
+                let v = turbo_dequantize(&vi, &vn, config)?;
                 Ok((k, v))
             }
         }
     }
 }
-
-// ============================================================
-// Arrays cache (linear attention) — unchanged
-// ============================================================
 
 /// Arrays cache for linear attention layers (GatedDeltaNet, 30 of 40).
 pub struct ArraysCache {
@@ -329,10 +281,6 @@ impl ArraysCache {
         self.items[idx] = Some(value);
     }
 }
-
-// ============================================================
-// Unified cache enum
-// ============================================================
 
 pub enum Cache {
     KV(KVCache),
