@@ -13,19 +13,19 @@ The key idea: Qwen3.5-35B-A3B only activates 3B parameters per token (8 of 256 e
 ├─────────────────────────────────────────────────────────┤
 │  engine.rs         Token loop + nucleus sampling        │
 ├─────────────────────────────────────────────────────────┤
-│  model/            Qwen3.5 MoE (mlx-rs)                │
+│  model/            Qwen3.5 MoE (mlx-rs)                 │
 │    mod.rs          TextModel, DecoderLayer              │
 │    attention.rs    Full attention (every 4th layer)     │
 │    gated_delta.rs  GatedDeltaNet linear attention       │
 │    moe.rs          SparseMoeBlock (256 experts, top-8)  │
-│    mlp.rs          Expert MLP (gate/up/down projections)│
+│    mlp.rs          Expert MLP (gate/up/down proj.)      │
 │    norm.rs         RMSNorm                              │
 ├─────────────────────────────────────────────────────────┤
 │  memory.rs         ExpertMemoryManager                  │
-│                    ├ GCD speculative prefetch (utility)  │
-│                    ├ GCD reactive prefetch (userInit)    │
-│                    ├ Zero-copy mmap → Metal buffers      │
-│                    └ Warm set pread (optional)           │
+│                    ├ GCD speculative prefetch (utility) │
+│                    ├ GCD reactive prefetch (userInit)   │
+│                    ├ Zero-copy mmap → Metal buffers     │
+│                    └ Warm set pread (optional)          │
 ├─────────────────────────────────────────────────────────┤
 │  cache.rs          KV cache + TurboQuant (optional)     │
 │  ffi.rs            gather_qmm FFI + array_from_mmap     │
@@ -36,7 +36,7 @@ The key idea: Qwen3.5-35B-A3B only activates 3B parameters per token (8 of 256 e
          ▼ SSD (mmap)                    ▲ Metal GPU
    ┌──────────────┐              ┌──────────────┐
    │  Expert ECB  │  ──pages──▶  │  GPU eval    │
-   │  files/layer │              │  (fault-free) │
+   │  files/layer │              │ (fault-free) │
    └──────────────┘              └──────────────┘
 ```
 
