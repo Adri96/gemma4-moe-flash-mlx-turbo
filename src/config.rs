@@ -35,6 +35,8 @@ pub struct RopeParameters {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct TextModelArgs {
+    #[serde(default)]
+    pub model_type: Option<String>,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -176,10 +178,9 @@ impl TextModelArgs {
     }
 
     pub fn model_type(&self) -> ModelType {
-        if self.layer_types.is_some() {
-            ModelType::Gemma4
-        } else {
-            ModelType::Qwen
+        match self.model_type.as_deref() {
+            Some(t) if t.starts_with("gemma4") => ModelType::Gemma4,
+            _ => ModelType::Qwen,
         }
     }
 
