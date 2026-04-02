@@ -71,10 +71,18 @@ impl DecoderLayer {
         }
     }
 
-    pub fn gate_for_prediction(&self) -> &QuantizedLinear {
+    pub fn prediction_context(&self) -> moe::PredictionContext<'_> {
         match &self.mlp {
-            MoeVariant::Qwen(moe) => &moe.gate,
-            MoeVariant::Gemma4(moe) => &moe.router_proj,
+            MoeVariant::Qwen(moe) => moe::PredictionContext::Qwen {
+                gate: &moe.gate,
+                ln: &self.post_attention_layernorm,
+            },
+            MoeVariant::Gemma4(moe) => moe::PredictionContext::Gemma4 {
+                router_proj: &moe.router_proj,
+                router_scale: &moe.router_scale,
+                root_size: moe.root_size,
+                rms_norm_eps: moe.rms_norm_eps,
+            },
         }
     }
 
@@ -85,7 +93,7 @@ impl DecoderLayer {
         cache: &mut Cache,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<(&QuantizedLinear, &norm::RMSNorm)>,
+        next_layer_gate: Option<moe::PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         if self.is_gemma4() {
@@ -102,7 +110,7 @@ impl DecoderLayer {
         cache: &mut Cache,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<(&QuantizedLinear, &norm::RMSNorm)>,
+        next_layer_gate: Option<moe::PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
@@ -131,7 +139,7 @@ impl DecoderLayer {
         cache: &mut Cache,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<(&QuantizedLinear, &norm::RMSNorm)>,
+        next_layer_gate: Option<moe::PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         // Attention block
@@ -267,7 +275,7 @@ impl TextModel {
             let layer = &mut head[i];
             let next_gate_ln = if speculate {
                 tail.first()
-                    .map(|next| (next.gate_for_prediction(), &next.post_attention_layernorm))
+                    .map(|next| next.prediction_context())
             } else {
                 None
             };

@@ -12,6 +12,53 @@ use crate::model::mlp::{QuantizedLinear, MLP};
 use crate::model::norm::RMSNorm;
 use crate::perf::PerfStats;
 
+/// Prediction context passed from layer L to predict layer L+1's routing.
+/// Carries the correct preprocessing for each model's router.
+pub enum PredictionContext<'a> {
+    /// Qwen: post_attention_layernorm → gate projection
+    Qwen {
+        gate: &'a QuantizedLinear,
+        ln: &'a RMSNorm,
+    },
+    /// Gemma4: RMSNormNoScale → ×root_size → ×router_scale → router_proj
+    Gemma4 {
+        router_proj: &'a QuantizedLinear,
+        router_scale: &'a Array,
+        root_size: f32,
+        rms_norm_eps: f32,
+    },
+}
+
+/// Predict top-12 experts for the next layer using L's MoE input and L+1's router params.
+fn predict_next_layer_experts(x: &Array, ctx: PredictionContext) -> Result<Array, Exception> {
+    let pred_k = 12i32;
+    let pred_logits = match ctx {
+        PredictionContext::Qwen { gate, ln } => {
+            let normed = ln.forward(x)?;
+            gate.forward(&normed)?
+        }
+        PredictionContext::Gemma4 { router_proj, router_scale, root_size, rms_norm_eps } => {
+            // Replicate the actual Gemma4 router preprocessing
+            let x2 = x * x;
+            let mean = mlx_rs::ops::mean_axes(&x2, &[-1], Some(true))?;
+            let eps = Array::from_f32(rms_norm_eps);
+            let rms = mlx_rs::ops::rsqrt(&(&mean + &eps))?;
+            let normed = x * &rms;
+            let root = Array::from_f32(root_size).as_dtype(x.dtype())?;
+            let scaled = &normed * &root;
+            let rs = router_scale.as_dtype(x.dtype())?;
+            let scaled = &scaled * &rs;
+            router_proj.forward(&scaled)?
+        }
+    };
+    let pred_inds = mlx_rs::ops::argpartition_axis(&pred_logits, -pred_k, -1)?;
+    let pred_num = pred_inds.dim(pred_inds.ndim() as i32 - 1);
+    let pred_split = pred_num - pred_k;
+    let pred_parts = mlx_rs::ops::split_sections(&pred_inds, &[pred_split], Some(-1))?;
+    let pred_topk = pred_parts[1].as_dtype(mlx_rs::Dtype::Int32)?;
+    pred_topk.reshape(&[-1])
+}
+
 /// Tracks gate-reuse prediction accuracy: how well layer L's gate input
 /// predicts layer L+1's routing when run through L+1's router.
 pub struct TransitionProfiler {
@@ -105,7 +152,7 @@ impl SparseMoeBlock {
         x: &Array,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<(&QuantizedLinear, &RMSNorm)>,
+        next_layer_gate: Option<PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let k = self.top_k as i32;
@@ -141,17 +188,8 @@ impl SparseMoeBlock {
 
         // Speculative prediction for next layer (lazy graph, batched with routing eval)
         let pred_flat = if is_decode {
-            if let Some((next_gate, next_ln)) = next_layer_gate {
-                let pred_k = 12i32;
-                let pred_normed = next_ln.forward(x)?;
-                let pred_logits = next_gate.forward(&pred_normed)?;
-                let pred_inds = mlx_rs::ops::argpartition_axis(&pred_logits, -pred_k, -1)?;
-                let pred_num = pred_inds.dim(pred_inds.ndim() as i32 - 1);
-                let pred_split = pred_num - pred_k;
-                let pred_parts =
-                    mlx_rs::ops::split_sections(&pred_inds, &[pred_split], Some(-1))?;
-                let pred_topk = pred_parts[1].as_dtype(mlx_rs::Dtype::Int32)?;
-                Some(pred_topk.reshape(&[-1])?)
+            if let Some(ctx) = next_layer_gate {
+                Some(predict_next_layer_experts(x, ctx)?)
             } else {
                 None
             }
@@ -401,7 +439,7 @@ impl Gemma4MoeBlock {
         x: &Array,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<(&QuantizedLinear, &RMSNorm)>,
+        next_layer_gate: Option<PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let k = self.top_k as i32;
@@ -441,17 +479,8 @@ impl Gemma4MoeBlock {
 
         // Speculative prediction for next layer
         let pred_flat = if is_decode {
-            if let Some((next_gate, next_ln)) = next_layer_gate {
-                let pred_k = 12i32;
-                let pred_normed = next_ln.forward(x)?;
-                let pred_logits = next_gate.forward(&pred_normed)?;
-                let pred_inds = mlx_rs::ops::argpartition_axis(&pred_logits, -pred_k, -1)?;
-                let pred_num = pred_inds.dim(pred_inds.ndim() as i32 - 1);
-                let pred_split = pred_num - pred_k;
-                let pred_parts =
-                    mlx_rs::ops::split_sections(&pred_inds, &[pred_split], Some(-1))?;
-                let pred_topk = pred_parts[1].as_dtype(mlx_rs::Dtype::Int32)?;
-                Some(pred_topk.reshape(&[-1])?)
+            if let Some(ctx) = next_layer_gate {
+                Some(predict_next_layer_experts(x, ctx)?)
             } else {
                 None
             }
