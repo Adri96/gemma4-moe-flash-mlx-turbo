@@ -203,14 +203,18 @@ impl KVCache {
         self.offset
     }
 
-    /// Read cached K/V without mutating. Returns None if empty or quantized.
+    /// Read cached K/V without mutating. Returns None if empty.
     /// For speculative attention that must not modify the real cache.
+    /// Works with both plain and TurboQuant caches (quantized stores bf16 after round-trip).
     pub fn peek_kv(&self) -> Option<(Array, Array)> {
         match &self.inner {
             KVCacheInner::Plain { keys: Some(k), values: Some(v) } => {
                 Some((k.clone(), v.clone()))
             }
-            _ => None, // quantized or empty — fall back to Level A.5
+            KVCacheInner::Quantized { keys: Some(k), values: Some(v), .. } => {
+                Some((k.clone(), v.clone()))
+            }
+            _ => None,
         }
     }
 
