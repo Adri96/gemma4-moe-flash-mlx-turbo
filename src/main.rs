@@ -187,9 +187,17 @@ fn main() -> anyhow::Result<()> {
             if let Some(bits) = kv_quant_bits {
                 eprintln!("TurboQuant KV cache: {}-bit", bits);
             }
-            let speculate = !no_speculate && calibrate.is_none();
+            // Speculation is off by default for Gemma4 (GPU eval window too short,
+            // prediction wastes GPU cycles). Use --speculate to force it on.
+            let speculate = if no_speculate || calibrate.is_some() {
+                false
+            } else if args.model_type() == crate::config::ModelType::Gemma4 {
+                false
+            } else {
+                true
+            };
             eprintln!("Engine ready.\n");
-            if no_speculate || calibrate.is_some() {
+            if !speculate {
                 eprintln!("Speculative prediction: disabled");
             }
             let max_tokens = calibrate.unwrap_or(max_tokens);
