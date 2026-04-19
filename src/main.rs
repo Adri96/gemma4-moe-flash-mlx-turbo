@@ -63,6 +63,12 @@ enum Command {
         /// Calibrate co-occurrence predictor using N tokens, save to model dir.
         #[arg(long)]
         calibrate: Option<usize>,
+        /// Print performance statistics after generation.
+        #[arg(long)]
+        stats: bool,
+        /// Interactive multi-turn chat mode (reads turns from stdin).
+        #[arg(long)]
+        chat: bool,
     },
 }
 
@@ -93,6 +99,8 @@ fn main() -> anyhow::Result<()> {
             no_speculate,
             warm_set,
             calibrate,
+            stats,
+            chat,
         } => {
             let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
             // Load config
@@ -100,33 +108,42 @@ fn main() -> anyhow::Result<()> {
             let (args, quant) = config::TextModelArgs::from_config_file(&config_path)?;
 
             // Load tokenizer
-            eprintln!("Loading tokenizer from {}...", tokenizer_path.display());
+            if stats { eprintln!("Loading tokenizer from {}...", tokenizer_path.display()); }
             let tokenizer = tokenizer::QwenTokenizer::from_dir(&tokenizer_path)?;
 
             // Apply chat template
             let is_gemma4 = args.model_type() == config::ModelType::Gemma4;
-            let chat_prompt = tokenizer
-                .apply_chat_template(&[tokenizer::ChatMessage {
-                    role: "user".to_string(),
-                    content: prompt.clone(),
-                }])
-                .unwrap_or_else(|_| {
+            let make_prompt = |messages: &[tokenizer::ChatMessage]| -> String {
+                tokenizer.apply_chat_template(messages).unwrap_or_else(|_| {
                     if is_gemma4 {
-                        format!("<bos><|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+                        let body: String = messages.iter().map(|m| {
+                            format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content)
+                        }).collect();
+                        format!("<bos>{}<|im_start|>assistant\n", body)
                     } else {
-                        format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+                        let body: String = messages.iter().map(|m| {
+                            format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content)
+                        }).collect();
+                        format!("{}<|im_start|>assistant\n", body)
                     }
-                });
+                })
+            };
+
+            let mut messages = vec![tokenizer::ChatMessage {
+                role: "user".to_string(),
+                content: prompt.clone(),
+            }];
+            let chat_prompt = make_prompt(&messages);
 
             // Create ExpertMemoryManager — mmaps expert files, used for on-demand loading
             let expert_dir = model_path.join("experts");
-            eprintln!("Mapping expert files from {}...", expert_dir.display());
+            if stats { eprintln!("Mapping expert files from {}...", expert_dir.display()); }
             let mut mem_mgr = memory::ExpertMemoryManager::new(&expert_dir, args.num_hidden_layers)?;
 
             // Load model FIRST (resident weights only — no expert arrays).
             // This allocates 2.76 GB of Metal buffers. Loading before warm set
             // prefetch ensures madvise pages aren't evicted by weight allocation.
-            eprintln!("Loading model from {}...", model_path.display());
+            if stats { eprintln!("Loading model from {}...", model_path.display()); }
             let mut model = model::load_model(&model_path, &args, quant.as_ref())?;
 
             // Prefetch warm set into page cache AFTER model loading
@@ -137,7 +154,7 @@ fn main() -> anyhow::Result<()> {
                 });
 
             if let Some(wp) = warm_path.filter(|_| warm_set) {
-                eprintln!("Prefetching warm set from {}...", wp.display());
+                if stats { eprintln!("Prefetching warm set from {}...", wp.display()); }
                 let warm: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(&wp)?)?;
                 let experts: Vec<(u32, u32)> = warm["experts"]
@@ -152,11 +169,13 @@ fn main() -> anyhow::Result<()> {
 
                 let advised = mem_mgr.mlock_warm_set(&experts);
                 mem_mgr.set_warm_set(&experts);
-                eprintln!(
-                    "Warm set: {} experts, prefetched {:.1} GB",
-                    experts.len(),
-                    advised as f64 / 1e9
-                );
+                if stats {
+                    eprintln!(
+                        "Warm set: {} experts, prefetched {:.1} GB",
+                        experts.len(),
+                        advised as f64 / 1e9
+                    );
+                }
             }
 
             // Load co-occurrence predictor if available
@@ -164,7 +183,7 @@ fn main() -> anyhow::Result<()> {
             let cooccur = if calibrate.is_none() && cooccur_path.exists() {
                 match model::moe::CooccurrencePredictor::load(&cooccur_path) {
                     Ok(p) => {
-                        eprintln!("Loaded co-occurrence predictor from {}", cooccur_path.display());
+                        if stats { eprintln!("Loaded co-occurrence predictor from {}", cooccur_path.display()); }
                         Some(p)
                     }
                     Err(e) => {
@@ -179,14 +198,10 @@ fn main() -> anyhow::Result<()> {
             // Set up calibration recorder if requested
             let recorder = calibrate.map(|_| {
                 let num_experts = args.num_experts;
-                eprintln!("Calibration mode: recording routing decisions");
+                if stats { eprintln!("Calibration mode: recording routing decisions"); }
                 model::moe::CalibrationRecorder::new(args.num_hidden_layers, num_experts)
             });
 
-            // Generate
-            if let Some(bits) = kv_quant_bits {
-                eprintln!("TurboQuant KV cache: {}-bit", bits);
-            }
             // Speculation is off by default for Gemma4 (GPU eval window too short,
             // prediction wastes GPU cycles). Use --speculate to force it on.
             let speculate = if no_speculate || calibrate.is_some() {
@@ -196,12 +211,17 @@ fn main() -> anyhow::Result<()> {
             } else {
                 true
             };
-            eprintln!("Engine ready.\n");
-            if !speculate {
-                eprintln!("Speculative prediction: disabled");
+            if stats {
+                if let Some(bits) = kv_quant_bits {
+                    eprintln!("TurboQuant KV cache: {}-bit", bits);
+                }
+                eprintln!("Engine ready.");
+                if !speculate {
+                    eprintln!("Speculative prediction: disabled");
+                }
             }
             let max_tokens = calibrate.unwrap_or(max_tokens);
-            let (_output, recorder) = engine::generate(
+            let (output, recorder) = engine::generate(
                 &mut model,
                 &tokenizer,
                 &chat_prompt,
@@ -213,13 +233,54 @@ fn main() -> anyhow::Result<()> {
                 speculate,
                 cooccur,
                 recorder,
+                stats,
             )?;
 
             // Save calibration results
             if let Some(recorder) = recorder {
                 let predictor = recorder.build_predictor(12);
                 predictor.save(&cooccur_path)?;
-                eprintln!("Saved co-occurrence predictor to {}", cooccur_path.display());
+                if stats { eprintln!("Saved co-occurrence predictor to {}", cooccur_path.display()); }
+            }
+
+            // Multi-turn chat loop
+            if chat {
+                use std::io::BufRead;
+                messages.push(tokenizer::ChatMessage {
+                    role: "assistant".to_string(),
+                    content: output,
+                });
+                let stdin = std::io::stdin();
+                loop {
+                    eprint!("\n> ");
+                    let mut line = String::new();
+                    if stdin.lock().read_line(&mut line)? == 0 { break; }
+                    let line = line.trim().to_string();
+                    if line.is_empty() || line == "/quit" { break; }
+                    messages.push(tokenizer::ChatMessage {
+                        role: "user".to_string(),
+                        content: line,
+                    });
+                    let turn_prompt = make_prompt(&messages);
+                    let (turn_output, _) = engine::generate(
+                        &mut model,
+                        &tokenizer,
+                        &turn_prompt,
+                        max_tokens,
+                        temperature,
+                        top_p,
+                        &mem_mgr,
+                        kv_quant_bits,
+                        speculate,
+                        None,
+                        None,
+                        stats,
+                    )?;
+                    messages.push(tokenizer::ChatMessage {
+                        role: "assistant".to_string(),
+                        content: turn_output,
+                    });
+                }
             }
         }
     }

@@ -24,6 +24,7 @@ pub fn generate(
     speculate: bool,
     cooccur: Option<CooccurrencePredictor>,
     recorder: Option<CalibrationRecorder>,
+    verbose: bool,
 ) -> anyhow::Result<(String, Option<CalibrationRecorder>)> {
     let perf = PerfStats::new();
     let num_layers = model.model.layers.len();
@@ -63,7 +64,7 @@ pub fn generate(
             });
         }
     }
-    if !tp_inner.router_weights.is_empty() {
+    if verbose && !tp_inner.router_weights.is_empty() {
         eprintln!("Level B prediction (CPU): {} layers", tp_inner.router_weights.len());
     }
 
@@ -72,7 +73,7 @@ pub fn generate(
     let mut cache = model.make_cache(kv_quant_bits);
 
     // Prefill
-    eprintln!("Prefilling {} tokens...", input_ids.len());
+    if verbose { eprintln!("Prefilling {} tokens...", input_ids.len()); }
     let t0 = Instant::now();
     let input = Array::from_slice(
         &input_ids.iter().map(|&x| x as i32).collect::<Vec<_>>(),
@@ -81,11 +82,13 @@ pub fn generate(
     let logits = model.forward(&input, &mut cache, mem, &perf, false, None)?;
     mlx_rs::transforms::eval(std::iter::once(&logits))?;
     let prefill_time = t0.elapsed();
-    eprintln!(
-        "Prefill: {:.2}s ({:.1} tok/s)",
-        prefill_time.as_secs_f64(),
-        input_ids.len() as f64 / prefill_time.as_secs_f64()
-    );
+    if verbose {
+        eprintln!(
+            "Prefill: {:.2}s ({:.1} tok/s)",
+            prefill_time.as_secs_f64(),
+            input_ids.len() as f64 / prefill_time.as_secs_f64()
+        );
+    }
 
     // Sample from last position
     let seq_len = logits.dim(1);
@@ -137,7 +140,7 @@ pub fn generate(
             prev_text_len = full_text.len();
         }
 
-        if tokens_generated % 10 == 0 {
+        if verbose && tokens_generated % 10 == 0 {
             let elapsed = t_start.elapsed().as_secs_f64();
             let interval_elapsed = t_interval.elapsed().as_secs_f64();
             let interval_rate = 10.0 / interval_elapsed;
@@ -152,32 +155,34 @@ pub fn generate(
     }
 
     println!();
-    let elapsed = t_start.elapsed().as_secs_f64();
-    eprintln!(
-        "\nGeneration: {} tokens in {:.2}s ({:.1} tok/s)",
-        tokens_generated, elapsed,
-        tokens_generated as f64 / elapsed
-    );
-
-    let (hits, misses, rate) = mem.take_hit_stats();
-    if hits + misses > 0 {
+    if verbose {
+        let elapsed = t_start.elapsed().as_secs_f64();
         eprintln!(
-            "Warm set hit rate: {:.1}% ({}/{} expert loads)",
-            rate * 100.0, hits, hits + misses
+            "\nGeneration: {} tokens in {:.2}s ({:.1} tok/s)",
+            tokens_generated, elapsed,
+            tokens_generated as f64 / elapsed
         );
-    }
 
-    let (ch, cm, cr) = mem.take_cache_stats();
-    if ch + cm > 0 {
-        eprintln!(
-            "Expert cache hit rate: {:.1}% ({}/{} lookups, cache size {})",
-            cr * 100.0, ch, ch + cm,
-            mem.cache_size(),
-        );
-    }
+        let (hits, misses, rate) = mem.take_hit_stats();
+        if hits + misses > 0 {
+            eprintln!(
+                "Warm set hit rate: {:.1}% ({}/{} expert loads)",
+                rate * 100.0, hits, hits + misses
+            );
+        }
 
-    perf.report(tokens_generated);
-    tp.borrow().report();
+        let (ch, cm, cr) = mem.take_cache_stats();
+        if ch + cm > 0 {
+            eprintln!(
+                "Expert cache hit rate: {:.1}% ({}/{} lookups, cache size {})",
+                cr * 100.0, ch, ch + cm,
+                mem.cache_size(),
+            );
+        }
+
+        perf.report(tokens_generated);
+        tp.borrow().report();
+    }
 
     let recorder = tp.into_inner().recorder;
     Ok((tokenizer.decode(&generated)?, recorder))

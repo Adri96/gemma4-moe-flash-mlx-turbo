@@ -18,6 +18,10 @@ impl QwenTokenizer {
         let template_path = path.join("chat_template.jinja");
         if template_path.exists() {
             let template = std::fs::read_to_string(&template_path)?;
+            // minijinja doesn't support Python's dict .get('key') method.
+            // Replace .get('key') → ['key'] which is equivalent in minijinja
+            // (returns Undefined for missing keys, which is falsy like None).
+            let template = fix_jinja_get_methods(&template);
             env.add_template_owned("chat".to_string(), template)?;
         }
 
@@ -93,4 +97,30 @@ impl QwenTokenizer {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+// Replace value.get('key') → value['key'] for minijinja compatibility.
+// Python Jinja2 supports dict.get() but minijinja doesn't expose it as a method.
+fn fix_jinja_get_methods(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(pos) = rest.find(".get('") {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos + 6..]; // skip past .get('
+        if let Some(end) = rest.find("')") {
+            let key = &rest[..end];
+            out.push('[');
+            out.push('\'');
+            out.push_str(key);
+            out.push('\'');
+            out.push(']');
+            rest = &rest[end + 2..]; // skip past ')
+        } else {
+            // Malformed, emit as-is and stop replacing
+            out.push_str(".get('");
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
 }
