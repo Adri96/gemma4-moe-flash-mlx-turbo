@@ -3,7 +3,7 @@
 All-Rust inference engine for sparse Mixture-of-Experts models on Apple Silicon. Runs large MoE models on an M4 Mac Mini with 16 GB of RAM by loading experts on-demand from SSD.
 
 **Supported models:**
-- **Gemma 4 26B-A4B** — 26B params, 4B active. 30 layers, 128 experts, top-8. Uses Unsloth UD dynamic 3-bit quantization.
+- **Gemma 4 26B-A4B** — 26B params, 4B active. 30 layers, 128 experts, top-8. Uses Unsloth UD dynamic 4-bit quantization.
 - **Qwen 3.5 35B-A3B** — 35B params, 3B active. 40 layers, 256 experts, top-8. Uniform 4-bit.
 
 The key idea: sparse MoE models only activate a small fraction of parameters per token (8 experts out of 128–256 per layer), so the full model doesn't need to fit in memory. flash-moe keeps resident weights in Metal buffers and loads experts on-demand from SSD via memory-mapped I/O, using GCD-dispatched prefetch to keep pages ahead of the GPU.
@@ -13,7 +13,7 @@ The key idea: sparse MoE models only activate a small fraction of parameters per
 The model is split into two parts:
 
 - **Resident weights** (~1.9–2.8 GB): embeddings, attention, norms, router, dense MLP, output head. Loaded once into Metal buffers at startup.
-- **Expert files** (~318–453 MB/layer): one ECB (expert-centric binary) file per layer. Memory-mapped but never fully loaded — only the 8 active experts are paged in per layer per token.
+- **Expert files** (~428–453 MB/layer): one ECB (expert-centric binary) file per layer. Memory-mapped but never fully loaded — only the 8 active experts are paged in per layer per token.
 
 ### I/O pipeline
 
@@ -37,11 +37,10 @@ Speculative prefetch needs to predict which experts the next layer will select. 
 
 | Model | Quant | Expert size | Active/layer | Layers | I/O per token |
 |-------|-------|------------|-------------|--------|--------------|
-| Gemma 4 26B (UD-3bit) | 3-bit | 2.60 MB | 20.8 MB | 30 | 624 MB |
-| Gemma 4 26B (old 4-bit) | 4-bit | 3.35 MB | 26.8 MB | 30 | 803 MB |
+| Gemma 4 26B (UD-4bit) | 4-bit | 3.35 MB | 26.8 MB | 30 | 803 MB |
 | Qwen 3.5 35B | 4-bit | 1.77 MB | 14.2 MB | 40 | 566 MB |
 
-Switching to Unsloth's dynamic 3-bit quantization cut Gemma 4's per-token I/O from 803 MB to 624 MB (-22%). Smaller experts also fit better in the page cache between tokens, reducing SSD reads further. The result: **6.5 tok/s** (from 3.1), a 2× speedup that exceeds the raw I/O reduction.
+Unsloth's dynamic 4-bit quantization uses mixed precision (4-bit experts, 8-bit attention, 6-bit embedding) for better output quality than uniform 4-bit, with no ghost-token artifacts from quantization. The tradeoff vs 3-bit: ~2× higher I/O per token (803 MB vs 624 MB), resulting in ~3–4 tok/s on a 16 GB M4 Mac Mini.
 
 ### Why not just load everything into RAM?
 
@@ -52,7 +51,7 @@ These models are 11–19 GB on disk. On a 16 GB machine, that means swap, and sw
 - **macOS** on Apple Silicon (tested on M4 Mac Mini, 16 GB)
 - **Rust** toolchain (stable)
 - **Model weights** (one of):
-  - [unsloth/gemma-4-26b-a4b-it-UD-MLX-3bit](https://huggingface.co/unsloth/gemma-4-26b-a4b-it-UD-MLX-3bit) (~12 GB, recommended)
+  - [unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit](https://huggingface.co/unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit) (~15 GB, recommended)
   - [mlx-community/Qwen3.5-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.5-35B-A3B-4bit) (~19 GB)
 
 ## Build
@@ -66,9 +65,9 @@ cargo build --release
 ### 1. Download the model
 
 ```bash
-# Gemma 4 UD-3bit (recommended)
-huggingface-cli download unsloth/gemma-4-26b-a4b-it-UD-MLX-3bit \
-  --local-dir ./gemma4-ud-3bit
+# Gemma 4 UD-4bit (recommended)
+huggingface-cli download unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit \
+  --local-dir ./gemma4-ud-4bit
 
 # Or Qwen 3.5
 huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit \
@@ -80,10 +79,10 @@ huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit \
 Converts HuggingFace safetensors into resident weights + per-layer expert ECB files:
 
 ```bash
-# Gemma 4 UD-3bit
+# Gemma 4 UD-4bit
 ./target/release/flash-moe split \
-  --model-path ./gemma4-ud-3bit \
-  --output-path ./split_gemma4_ud3
+  --model-path ./gemma4-ud-4bit \
+  --output-path ./split_gemma4_ud4
 
 # Qwen 3.5
 ./target/release/flash-moe split \
@@ -96,10 +95,10 @@ One-time step. You can delete the original download after splitting.
 ### 3. Generate
 
 ```bash
-# Gemma 4 UD-3bit
+# Gemma 4 UD-4bit
 ./target/release/flash-moe generate \
-  --model-path ./split_gemma4_ud3 \
-  --tokenizer-path ./gemma4-ud-3bit \
+  --model-path ./split_gemma4_ud4 \
+  --tokenizer-path ./gemma4-ud-4bit \
   --prompt "Explain the Riemann hypothesis in simple terms" \
   --max-tokens 256
 
