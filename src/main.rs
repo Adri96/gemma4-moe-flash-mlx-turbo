@@ -206,7 +206,13 @@ fn main() -> anyhow::Result<()> {
                 model::moe::CalibrationRecorder::new(args.num_hidden_layers, num_experts)
             });
 
-            let speculate = !no_speculate && calibrate.is_none();
+            // Speculation is OFF by default for Gemma 4. Level C prediction's virtual KV
+            // concat in forward_speculative grows linearly with cache length and burns
+            // ~24 ms of GPU compute per token for near-zero accuracy benefit (commit
+            // 10ecf97). At long contexts (200+ tokens) this manifests as a generation
+            // hang. `--no-speculate` is kept as a no-op for backwards compat.
+            let _ = no_speculate;
+            let speculate = false;
             if stats {
                 if let Some(bits) = kv_quant_bits {
                     eprintln!("TurboQuant KV cache: {}-bit", bits);

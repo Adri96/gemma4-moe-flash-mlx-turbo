@@ -128,6 +128,7 @@ pub struct TextModel {
     pub layers: Vec<DecoderLayer>,
     pub norm: RMSNorm,
     pub embed_scale: Option<f32>,
+    pub sliding_window: Option<usize>,
 }
 
 impl TextModel {
@@ -174,7 +175,7 @@ impl TextModel {
             }
         }
         let full_mask = create_attention_mask(&hidden, full_offset)?;
-        let sliding_mask = create_sliding_mask(&hidden, sliding_offset)?;
+        let sliding_mask = create_sliding_mask(&hidden, sliding_offset, self.sliding_window)?;
 
         let mut h = hidden;
         let num_layers = self.layers.len();
@@ -577,6 +578,7 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
             layers,
             norm: final_norm,
             embed_scale: Some((args.hidden_size as f32).sqrt()),
+            sliding_window: args.sliding_window,
         },
         lm_head: dummy_lm_head,
         tie_word_embeddings: args.tie_word_embeddings,
@@ -673,9 +675,42 @@ fn create_attention_mask(
     Ok(Some(additive))
 }
 
+/// Sliding-window causal mask: position i attends to j iff j <= i AND i - j < window.
+/// When `window` is None, falls back to a plain causal mask.
 fn create_sliding_mask(
     hidden: &Array,
     cache_offset: usize,
+    window: Option<usize>,
 ) -> Result<Option<Array>, Exception> {
-    create_attention_mask(hidden, cache_offset)
+    let seq_len = hidden.dim(1) as usize;
+    if seq_len == 0 {
+        return Ok(None);
+    }
+    let total_len = cache_offset + seq_len;
+    let Some(window) = window else {
+        return create_attention_mask(hidden, cache_offset);
+    };
+    // Single-token decode with everything inside the window: no mask needed.
+    if seq_len == 1 && total_len <= window {
+        return Ok(None);
+    }
+
+    let rows = Array::from_iter(
+        (cache_offset as i32)..(total_len as i32),
+        &[seq_len as i32, 1],
+    );
+    let cols = Array::from_iter(0..(total_len as i32), &[1, total_len as i32]);
+    // Causal: j <= i
+    let causal = rows.ge(&cols)?;
+    // Window: i - j < window  ⇔  j > i - window
+    let window_arr = Array::from_int(window as i32);
+    let lower = &rows - &window_arr;
+    let in_window = cols.gt(&lower)?;
+    let mask = causal.logical_and(&in_window)?;
+    let zero = Array::from_f32(0.0);
+    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+    let additive = mlx_rs::ops::r#where(&mask, &zero, &neg_inf)?;
+    let additive = additive.reshape(&[1, 1, seq_len as i32, total_len as i32])?;
+    let additive = additive.as_dtype(hidden.dtype())?;
+    Ok(Some(additive))
 }
