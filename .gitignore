@@ -34,7 +34,8 @@ bld/
 [Ll]og/
 [Ll]ogs/
 target/*
-
+gemma4-ud-4bit/*
+split_gemma4_ud4/*
 # Build results on 'Bin' directories
 **/[Bb]in/*
 # Uncomment if you have tasks that rely on *.refresh files to move binaries

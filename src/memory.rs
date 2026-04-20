@@ -65,38 +65,6 @@ enum ExpertFormat {
 
 // ── Shared types ────────────────────────────────────────────────────────────
 
-/// The 9 expert arrays extracted for a set of active experts.
-/// Each array has shape [num_experts, d1, d2].
-pub struct ExpertSlice {
-    pub gate_weight: Array,
-    pub gate_scales: Array,
-    pub gate_biases: Array,
-    pub up_weight: Array,
-    pub up_scales: Array,
-    pub up_biases: Array,
-    pub down_weight: Array,
-    pub down_scales: Array,
-    pub down_biases: Array,
-}
-
-impl ExpertSlice {
-    /// Construct from a Vec of exactly 9 arrays in gate/up/down × weight/scales/biases order.
-    fn from_arrays(mut arrays: Vec<Array>) -> Self {
-        debug_assert_eq!(arrays.len(), 9);
-        Self {
-            gate_weight: arrays.remove(0),
-            gate_scales: arrays.remove(0),
-            gate_biases: arrays.remove(0),
-            up_weight: arrays.remove(0),
-            up_scales: arrays.remove(0),
-            up_biases: arrays.remove(0),
-            down_weight: arrays.remove(0),
-            down_scales: arrays.remove(0),
-            down_biases: arrays.remove(0),
-        }
-    }
-}
-
 /// A single expert's 9 tensors (not stacked across experts).
 /// Each tensor has shape [d1, d2] — for per-expert quantized_matmul.
 pub struct SingleExpertTensors {
@@ -159,6 +127,7 @@ extern "C" {
     fn dispatch_group_enter(group: *mut std::ffi::c_void);
     fn dispatch_group_leave(group: *mut std::ffi::c_void);
     fn dispatch_group_wait(group: *mut std::ffi::c_void, timeout: u64) -> isize;
+    fn dispatch_time(when: u64, delta: i64) -> u64;
     fn dispatch_async_f(
         queue: *mut std::ffi::c_void,
         context: *mut std::ffi::c_void,
@@ -169,7 +138,7 @@ extern "C" {
 
 const QOS_CLASS_USER_INITIATED: isize = 0x19;
 const QOS_CLASS_UTILITY: isize = 0x11;
-const DISPATCH_TIME_FOREVER: u64 = !0;
+const DISPATCH_TIME_NOW: u64 = 0;
 
 /// Context for a GCD prefetch task. Box'd and transferred via raw pointer.
 struct GcdPrefetchCtx {
@@ -433,22 +402,6 @@ impl ExpertMemoryManager {
     pub fn cache_size(&self) -> usize { 0 }
 
 
-    /// Partition expert indices into (warm, cold) based on the static warm set.
-    /// Warm experts are likely in page cache (free via mmap). Cold experts need
-    /// SSD reads — the I/O thread should prioritize these.
-    pub fn partition_warm_cold(&self, layer: usize, expert_indices: &[i32]) -> (Vec<i32>, Vec<i32>) {
-        let mut warm = Vec::new();
-        let mut cold = Vec::new();
-        for &eidx in expert_indices {
-            if self.warm_set.contains(&(layer as u32, eidx as u32)) {
-                warm.push(eidx);
-            } else {
-                cold.push(eidx);
-            }
-        }
-        (warm, cold)
-    }
-
     /// Parallel pread to warm the page cache. Used at startup for warm set prefetch.
     pub fn pread_experts_sync(&self, layer: usize, expert_indices: &[i32]) {
         match &self.format {
@@ -466,109 +419,6 @@ impl ExpertMemoryManager {
             }
             _ => {}
         }
-    }
-
-    /// Extract specific experts from a layer.
-    /// Dispatches to ECB (8 parallel preads) or safetensors (72 preads) path.
-    pub fn extract_experts(&self, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
-        // Track warm set hits
-        for &eidx in expert_indices {
-            if self.warm_set.contains(&(layer as u32, eidx as u32)) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        match &self.format {
-            ExpertFormat::Ecb(infos) => self.extract_experts_ecb(&infos[layer], layer, expert_indices),
-            ExpertFormat::Safetensors(offsets) => self.extract_experts_safetensors(&offsets[layer], layer, expert_indices),
-        }
-    }
-
-    /// ECB extract: 8 parallel preads (one per expert, ~3.375 MB each),
-    /// then scatter into 9 per-tensor arrays for gather_qmm.
-    fn extract_experts_ecb(&self, info: &EcbLayerInfo, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
-        let file = &self.files[layer];
-        let stride = info.per_expert_stride;
-        let n = expert_indices.len();
-
-        // Parallel pread: one large contiguous read per expert.
-        // Uninitialized buffers — pread overwrites every byte.
-        let expert_bufs: Vec<Vec<u8>> = expert_indices.par_iter()
-            .map(|&eidx| {
-                let mut buf = Vec::with_capacity(stride);
-                unsafe { buf.set_len(stride); }
-                let offset = info.data_start as u64 + eidx as u64 * stride as u64;
-                file.read_exact_at(&mut buf, offset).expect("pread failed");
-                buf
-            })
-            .collect();
-
-        // Scatter into 9 per-tensor buffers via direct indexing (no extend_from_slice)
-        let mut arrays = Vec::with_capacity(9);
-        for tensor in &info.tensors {
-            let t_stride = tensor.stride;
-            let total = n * t_stride;
-            let mut tensor_buf = Vec::with_capacity(total);
-            unsafe { tensor_buf.set_len(total); }
-
-            for (i, expert_buf) in expert_bufs.iter().enumerate() {
-                tensor_buf[i * t_stride..(i + 1) * t_stride]
-                    .copy_from_slice(&expert_buf[tensor.offset_within_expert..tensor.offset_within_expert + t_stride]);
-            }
-
-            let mut shape = vec![n as i32];
-            shape.extend_from_slice(&tensor.expert_shape);
-            let arr = unsafe {
-                Array::from_raw_data(
-                    tensor_buf.as_ptr() as *const std::ffi::c_void,
-                    &shape,
-                    tensor.dtype,
-                )
-            };
-            arrays.push(arr);
-        }
-
-        ExpertSlice::from_arrays(arrays)
-    }
-
-    /// Safetensors extract: 72 preads per layer (9 tensors × 8 experts).
-    /// Kept as fallback for backward compatibility.
-    fn extract_experts_safetensors(&self, layer_offsets: &LayerTensorOffsets, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
-        let file = &self.files[layer];
-        let n = expert_indices.len() as i32;
-
-        let mut arrays = Vec::with_capacity(9);
-        for tensor in &layer_offsets.tensors {
-            let stride = tensor.per_expert_stride;
-            let total = expert_indices.len() * stride;
-            let mut buf = vec![0u8; total];
-
-            for (i, &eidx) in expert_indices.iter().enumerate() {
-                let file_offset = (layer_offsets.data_start
-                    + tensor.data_offset
-                    + eidx as usize * stride) as u64;
-                file.read_exact_at(
-                    &mut buf[i * stride..(i + 1) * stride],
-                    file_offset,
-                )
-                .expect("pread failed");
-            }
-
-            let mut shape = vec![n];
-            shape.extend_from_slice(&tensor.expert_shape);
-            let arr = unsafe {
-                Array::from_raw_data(
-                    buf.as_ptr() as *const std::ffi::c_void,
-                    &shape,
-                    tensor.dtype,
-                )
-            };
-            arrays.push(arr);
-        }
-
-        ExpertSlice::from_arrays(arrays)
     }
 
     /// Zero-copy extract: create MLX arrays backed directly by mmap'd memory.
@@ -609,39 +459,6 @@ impl ExpertMemoryManager {
             down_weight: arrays.remove(0),
             down_scales: arrays.remove(0),
             down_biases: arrays.remove(0),
-        }
-    }
-
-    /// Issue F_RDADVISE for the next layer's expected expert regions.
-    /// Non-blocking — kernel reads asynchronously while GPU processes current layer.
-    /// Exploits expert locality across adjacent layers.
-    pub fn prefetch_next_layer(&self, current_layer: usize, expert_indices: &[i32]) {
-        let next_layer = current_layer + 1;
-        if next_layer >= self.files.len() {
-            return;
-        }
-
-        let fd = self.files[next_layer].as_raw_fd();
-
-        match &self.format {
-            ExpertFormat::Ecb(infos) => {
-                let info = &infos[next_layer];
-                let stride = info.per_expert_stride;
-                for &eidx in expert_indices {
-                    issue_rdadvise(fd, info.data_start + eidx as usize * stride, stride);
-                }
-            }
-            ExpertFormat::Safetensors(offsets) => {
-                let layer_offsets = &offsets[next_layer];
-                for &eidx in expert_indices {
-                    for tensor in &layer_offsets.tensors {
-                        let offset = layer_offsets.data_start
-                            + tensor.data_offset
-                            + eidx as usize * tensor.per_expert_stride;
-                        issue_rdadvise(fd, offset, tensor.per_expert_stride);
-                    }
-                }
-            }
         }
     }
 
@@ -759,12 +576,17 @@ impl ExpertMemoryManager {
     }
 
     /// Block until reactive prefetch group completes, then release it.
+    /// Uses a 30-second timeout to prevent infinite hangs on I/O stalls.
     pub fn wait_prefetch_group(&self, group: *mut std::ffi::c_void) {
         if group.is_null() {
             return;
         }
         unsafe {
-            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+            let timeout = dispatch_time(DISPATCH_TIME_NOW, 30_000_000_000i64);
+            let timed_out = dispatch_group_wait(group, timeout);
+            if timed_out != 0 {
+                eprintln!("WARNING: reactive prefetch timed out after 30s — expert I/O stalled");
+            }
             dispatch_release(group);
         }
     }

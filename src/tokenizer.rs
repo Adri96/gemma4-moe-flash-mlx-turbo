@@ -91,6 +91,20 @@ impl QwenTokenizer {
     pub fn is_eos(&self, token_id: u32) -> bool {
         self.eos_token_ids.contains(&token_id)
     }
+
+    /// Decode a single token to its string representation (used for ghost-token detection).
+    pub fn decode_token(&self, id: u32) -> Option<String> {
+        self.tokenizer.decode(&[id], true).ok()
+    }
+
+    /// Returns (open_id, close_id) for Gemma4's thinking channel tokens
+    /// (<|channel> and <channel|>). Both are None for tokenizers that lack them.
+    pub fn thinking_channel_tokens(&self) -> (Option<u32>, Option<u32>) {
+        let vocab = self.tokenizer.get_vocab(true);
+        let open = vocab.get("<|channel>").copied();
+        let close = vocab.get("<channel|>").copied();
+        (open, close)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

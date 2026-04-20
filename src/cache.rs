@@ -256,58 +256,26 @@ impl KVCache {
     }
 }
 
-/// Arrays cache for linear attention layers (GatedDeltaNet, 30 of 40).
-pub struct ArraysCache {
-    pub items: Vec<Option<Array>>,
-}
-
-impl ArraysCache {
-    pub fn new(size: usize) -> Self {
-        Self {
-            items: (0..size).map(|_| None).collect(),
-        }
-    }
-
-    pub fn get(&self, idx: usize) -> Option<&Array> {
-        self.items[idx].as_ref()
-    }
-
-    pub fn set(&mut self, idx: usize, value: Array) {
-        self.items[idx] = Some(value);
-    }
-}
-
 pub enum Cache {
     KV(KVCache),
-    Arrays(ArraysCache),
 }
 
 impl Cache {
     pub fn as_kv_mut(&mut self) -> &mut KVCache {
         match self {
             Cache::KV(kv) => kv,
-            _ => panic!("expected KVCache"),
         }
     }
 
     pub fn as_kv_ref(&self) -> Option<&KVCache> {
         match self {
             Cache::KV(kv) => Some(kv),
-            _ => None,
-        }
-    }
-
-    pub fn as_arrays_mut(&mut self) -> &mut ArraysCache {
-        match self {
-            Cache::Arrays(ac) => ac,
-            _ => panic!("expected ArraysCache"),
         }
     }
 
     pub fn kv_offset(&self) -> usize {
         match self {
             Cache::KV(kv) => kv.offset(),
-            _ => 0,
         }
     }
 }

@@ -69,6 +69,9 @@ enum Command {
         /// Interactive multi-turn chat mode (reads turns from stdin).
         #[arg(long)]
         chat: bool,
+        /// Print each generated token ID and text (for debugging output artifacts).
+        #[arg(long)]
+        debug_tokens: bool,
     },
 }
 
@@ -101,6 +104,7 @@ fn main() -> anyhow::Result<()> {
             calibrate,
             stats,
             chat,
+            debug_tokens,
         } => {
             let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
             // Load config
@@ -112,20 +116,12 @@ fn main() -> anyhow::Result<()> {
             let tokenizer = tokenizer::QwenTokenizer::from_dir(&tokenizer_path)?;
 
             // Apply chat template
-            let is_gemma4 = args.model_type() == config::ModelType::Gemma4;
             let make_prompt = |messages: &[tokenizer::ChatMessage]| -> String {
                 tokenizer.apply_chat_template(messages).unwrap_or_else(|_| {
-                    if is_gemma4 {
-                        let body: String = messages.iter().map(|m| {
-                            format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content)
-                        }).collect();
-                        format!("<bos>{}<|im_start|>assistant\n", body)
-                    } else {
-                        let body: String = messages.iter().map(|m| {
-                            format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content)
-                        }).collect();
-                        format!("{}<|im_start|>assistant\n", body)
-                    }
+                    let body: String = messages.iter().map(|m| {
+                        format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content)
+                    }).collect();
+                    format!("<bos>{}<|im_start|>assistant\n", body)
                 })
             };
 
@@ -134,6 +130,14 @@ fn main() -> anyhow::Result<()> {
                 content: prompt.clone(),
             }];
             let chat_prompt = make_prompt(&messages);
+
+            if debug_tokens {
+                // Show the last 120 chars of the rendered prompt to verify template output
+                let tail_start = chat_prompt.len().saturating_sub(120);
+                eprintln!("[debug] prompt tail: {:?}", &chat_prompt[tail_start..]);
+                let (to, tc) = tokenizer.thinking_channel_tokens();
+                eprintln!("[debug] thinking_open={:?}  thinking_close={:?}", to, tc);
+            }
 
             // Create ExpertMemoryManager — mmaps expert files, used for on-demand loading
             let expert_dir = model_path.join("experts");
@@ -144,7 +148,7 @@ fn main() -> anyhow::Result<()> {
             // This allocates 2.76 GB of Metal buffers. Loading before warm set
             // prefetch ensures madvise pages aren't evicted by weight allocation.
             if stats { eprintln!("Loading model from {}...", model_path.display()); }
-            let mut model = model::load_model(&model_path, &args, quant.as_ref())?;
+            let mut model = model::load_model(&model_path, &args, quant.as_ref(), stats)?;
 
             // Prefetch warm set into page cache AFTER model loading
             let warm_path = warm_experts
@@ -202,15 +206,7 @@ fn main() -> anyhow::Result<()> {
                 model::moe::CalibrationRecorder::new(args.num_hidden_layers, num_experts)
             });
 
-            // Speculation is off by default for Gemma4 (GPU eval window too short,
-            // prediction wastes GPU cycles). Use --speculate to force it on.
-            let speculate = if no_speculate || calibrate.is_some() {
-                false
-            } else if args.model_type() == crate::config::ModelType::Gemma4 {
-                false
-            } else {
-                true
-            };
+            let speculate = !no_speculate && calibrate.is_none();
             if stats {
                 if let Some(bits) = kv_quant_bits {
                     eprintln!("TurboQuant KV cache: {}-bit", bits);
@@ -234,6 +230,7 @@ fn main() -> anyhow::Result<()> {
                 cooccur,
                 recorder,
                 stats,
+                debug_tokens,
             )?;
 
             // Save calibration results
@@ -245,14 +242,15 @@ fn main() -> anyhow::Result<()> {
 
             // Multi-turn chat loop
             if chat {
-                use std::io::BufRead;
+                use std::io::{BufRead, Write};
                 messages.push(tokenizer::ChatMessage {
                     role: "assistant".to_string(),
                     content: output,
                 });
                 let stdin = std::io::stdin();
                 loop {
-                    eprint!("\n> ");
+                    print!("\n> ");
+                    std::io::stdout().flush().ok();
                     let mut line = String::new();
                     if stdin.lock().read_line(&mut line)? == 0 { break; }
                     let line = line.trim().to_string();
@@ -275,6 +273,7 @@ fn main() -> anyhow::Result<()> {
                         None,
                         None,
                         stats,
+                        debug_tokens,
                     )?;
                     messages.push(tokenizer::ChatMessage {
                         role: "assistant".to_string(),

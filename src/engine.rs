@@ -25,6 +25,7 @@ pub fn generate(
     cooccur: Option<CooccurrencePredictor>,
     recorder: Option<CalibrationRecorder>,
     verbose: bool,
+    debug_tokens: bool,
 ) -> anyhow::Result<(String, Option<CalibrationRecorder>)> {
     let perf = PerfStats::new();
     let num_layers = model.model.layers.len();
@@ -34,35 +35,29 @@ pub fn generate(
 
     // Populate Level B router weights from Gemma4 layers (pre-convert to f32 for CPU)
     for layer in &model.model.layers {
-        if let MoeVariant::Gemma4(ref moe) = layer.mlp {
-            // Convert router_scale bf16 → f32
-            let rs_f32 = moe.router_scale.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-            mlx_rs::transforms::eval(std::iter::once(&rs_f32)).unwrap();
-            let rs_data: &[f32] = rs_f32.as_slice();
-
-            // Read quantized projection weights as raw slices
-            let w_data: &[u32] = moe.router_proj.weight.as_slice();
-            let s_f32 = moe.router_proj.scales.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-            let b_f32 = moe.router_proj.biases.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-            mlx_rs::transforms::eval([&s_f32, &b_f32]).unwrap();
-            let s_data: &[f32] = s_f32.as_slice();
-            let b_data: &[f32] = b_f32.as_slice();
-
-            let hidden_size = rs_data.len();
-            let num_experts = moe.router_proj.weight.dim(0) as usize;
-
-            tp_inner.router_weights.push(RouterWeightsRef {
-                router_scale_f32: rs_data.to_vec(),
-                proj_weight_u32: w_data.to_vec(),
-                proj_scales_f32: s_data.to_vec(),
-                proj_biases_f32: b_data.to_vec(),
-                num_experts,
-                hidden_size,
-                group_size: moe.group_size as usize,
-                root_size: moe.root_size,
-                rms_norm_eps: moe.rms_norm_eps,
-            });
-        }
+        let MoeVariant::Gemma4(ref moe) = layer.mlp;
+        let rs_f32 = moe.router_scale.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&rs_f32)).unwrap();
+        let rs_data: &[f32] = rs_f32.as_slice();
+        let w_data: &[u32] = moe.router_proj.weight.as_slice();
+        let s_f32 = moe.router_proj.scales.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let b_f32 = moe.router_proj.biases.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&s_f32, &b_f32]).unwrap();
+        let s_data: &[f32] = s_f32.as_slice();
+        let b_data: &[f32] = b_f32.as_slice();
+        let hidden_size = rs_data.len();
+        let num_experts = moe.router_proj.weight.dim(0) as usize;
+        tp_inner.router_weights.push(RouterWeightsRef {
+            router_scale_f32: rs_data.to_vec(),
+            proj_weight_u32: w_data.to_vec(),
+            proj_scales_f32: s_data.to_vec(),
+            proj_biases_f32: b_data.to_vec(),
+            num_experts,
+            hidden_size,
+            group_size: moe.group_size as usize,
+            root_size: moe.root_size,
+            rms_norm_eps: moe.rms_norm_eps,
+        });
     }
     if verbose && !tp_inner.router_weights.is_empty() {
         eprintln!("Level B prediction (CPU): {} layers", tp_inner.router_weights.len());
@@ -98,10 +93,31 @@ pub fn generate(
     let mut next_token = sample(&last_logits, temperature, top_p)?;
     mlx_rs::transforms::eval(std::iter::once(&next_token))?;
 
-    let mut generated: Vec<u32> = vec![next_token.item::<i32>() as u32];
-    let mut stdout = std::io::stdout();
+    let (think_open, think_close) = tokenizer.thinking_channel_tokens();
+    let mut in_thinking = false;
+    let mut in_ghost_zone = false;
+    let mut visible_generated: Vec<u32> = Vec::new();
 
-    let text = tokenizer.decode(&generated)?;
+    let first_tok = next_token.item::<i32>() as u32;
+    let mut generated: Vec<u32> = vec![first_tok];
+    if Some(first_tok) == think_open {
+        in_thinking = true;
+    } else if Some(first_tok) == think_close {
+        in_thinking = false;
+    } else if !in_thinking {
+        if !in_ghost_zone || is_structural_content_start(first_tok, tokenizer) {
+            visible_generated.push(first_tok);
+            in_ghost_zone = false;
+        }
+        if after_structural_marker(&visible_generated) { in_ghost_zone = true; }
+    }
+    if debug_tokens {
+        let tok_text = tokenizer.decode(&[first_tok]).unwrap_or_default();
+        eprintln!("[tok] id={} in_thinking={} text={:?}", first_tok, in_thinking, tok_text);
+    }
+
+    let mut stdout = std::io::stdout();
+    let text = tokenizer.decode(&visible_generated)?;
     print!("{}", text);
     stdout.flush().ok();
 
@@ -132,8 +148,25 @@ pub fn generate(
         generated.push(new_tok);
         tokens_generated += 1;
 
-        // Stream
-        let full_text = tokenizer.decode(&generated)?;
+        // Track thinking channel state, stream only visible tokens
+        if Some(new_tok) == think_open {
+            in_thinking = true;
+        } else if Some(new_tok) == think_close {
+            in_thinking = false;
+        } else if !in_thinking {
+            if !in_ghost_zone || is_structural_content_start(new_tok, tokenizer) {
+                visible_generated.push(new_tok);
+                in_ghost_zone = false;
+            }
+            // Re-enter ghost zone after each structural marker
+            if after_structural_marker(&visible_generated) { in_ghost_zone = true; }
+        }
+        if debug_tokens {
+            let tok_text = tokenizer.decode(&[new_tok]).unwrap_or_default();
+            eprintln!("[tok] id={} in_thinking={} text={:?}", new_tok, in_thinking, tok_text);
+        }
+
+        let full_text = tokenizer.decode(&visible_generated)?;
         if full_text.len() > prev_text_len {
             print!("{}", &full_text[prev_text_len..]);
             stdout.flush().ok();
@@ -155,13 +188,14 @@ pub fn generate(
     }
 
     println!();
+    let elapsed = t_start.elapsed().as_secs_f64();
+    eprintln!(
+        "{} tokens in {:.1}s ({:.1} tok/s)",
+        tokens_generated, elapsed,
+        tokens_generated as f64 / elapsed
+    );
     if verbose {
-        let elapsed = t_start.elapsed().as_secs_f64();
-        eprintln!(
-            "\nGeneration: {} tokens in {:.2}s ({:.1} tok/s)",
-            tokens_generated, elapsed,
-            tokens_generated as f64 / elapsed
-        );
+        eprintln!();
 
         let (hits, misses, rate) = mem.take_hit_stats();
         if hits + misses > 0 {
@@ -185,7 +219,39 @@ pub fn generate(
     }
 
     let recorder = tp.into_inner().recorder;
-    Ok((tokenizer.decode(&generated)?, recorder))
+    Ok((tokenizer.decode(&visible_generated)?, recorder))
+}
+
+/// Returns true if a token is a valid content-starting token after a structural marker
+/// (bullet `*   ` or section header `### `).
+/// Valid starts: `**` (bold label), uppercase letter, digit, `(`, `[`.
+/// Invalid (ghost): lowercase words, `-`, `#` (doubled header), whitespace-only, etc.
+fn is_structural_content_start(tok: u32, tokenizer: &crate::tokenizer::QwenTokenizer) -> bool {
+    if let Some(text) = tokenizer.decode_token(tok) {
+        let t = text.trim_start(); // strip leading spaces
+        if t.is_empty() { return false; } // whitespace-only token: skip
+        let first = t.chars().next().unwrap();
+        // Accept: bold `**`, any uppercase letter, digit, open paren/bracket.
+        // Reject: `#` (doubled header like `### ###`), lowercase, punctuation like `-`.
+        (first == '*' && t.starts_with("**"))
+            || first.is_uppercase()
+            || first.is_ascii_digit()
+            || first == '('
+            || first == '['
+    } else {
+        false
+    }
+}
+
+/// Returns true if visible ends with a structural marker (bullet or section header)
+/// that should trigger ghost-zone filtering.
+fn after_structural_marker(visible: &[u32]) -> bool {
+    let n = visible.len();
+    if n < 2 { return false; }
+    matches!(
+        (visible[n-2], visible[n-1]),
+        (236829, 139) | (10354, 236743) | (10354, 236829)
+    )
 }
 
 fn sample(logits: &Array, temperature: f32, top_p: f32) -> Result<Array, Exception> {

@@ -2,12 +2,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ModelType {
-    Qwen,
-    Gemma4,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuantOverride {
     pub bits: u32,
@@ -116,36 +110,16 @@ pub struct TextModelArgs {
     pub intermediate_size: Option<usize>,
     pub num_experts: usize,
     pub moe_intermediate_size: usize,
-    #[serde(default)]
-    pub shared_expert_intermediate_size: usize,
     #[serde(default = "default_true")]
-    pub norm_topk_prob: bool,
-    #[serde(default)]
     pub tie_word_embeddings: bool,
-    #[serde(default = "default_full_attn_interval")]
-    pub full_attention_interval: usize,
 
-    // MoE top-k: Qwen uses num_experts_per_tok, Gemma4 uses top_k_experts
+    // MoE top-k
     #[serde(default)]
     pub num_experts_per_tok: Option<usize>,
     #[serde(default)]
     pub top_k_experts: Option<usize>,
 
-    // Linear attention (GatedDeltaNet) — Qwen only
-    #[serde(default = "default_32")]
-    pub linear_num_value_heads: usize,
-    #[serde(default = "default_16")]
-    pub linear_num_key_heads: usize,
-    #[serde(default = "default_128")]
-    pub linear_key_head_dim: usize,
-    #[serde(default = "default_128")]
-    pub linear_value_head_dim: usize,
-    #[serde(default = "default_4")]
-    pub linear_conv_kernel_dim: usize,
-
     // RoPE
-    #[serde(default = "default_partial_rotary")]
-    pub partial_rotary_factor: f64,
     #[serde(default)]
     pub max_position_embeddings: Option<usize>,
     #[serde(default)]
@@ -205,26 +179,8 @@ fn default_rope_theta_10k() -> f64 {
 fn default_1_0() -> f64 {
     1.0
 }
-fn default_partial_rotary() -> f64 {
-    0.25
-}
 fn default_true() -> bool {
     true
-}
-fn default_full_attn_interval() -> usize {
-    4
-}
-fn default_32() -> usize {
-    32
-}
-fn default_16() -> usize {
-    16
-}
-fn default_128() -> usize {
-    128
-}
-fn default_4() -> usize {
-    4
 }
 
 impl TextModelArgs {
@@ -243,32 +199,10 @@ impl TextModelArgs {
         Ok((args, quant))
     }
 
-    pub fn model_type(&self) -> ModelType {
-        match self.model_type.as_deref() {
-            Some(t) if t.starts_with("gemma4") => ModelType::Gemma4,
-            _ => ModelType::Qwen,
-        }
-    }
-
     pub fn experts_per_tok(&self) -> usize {
         self.top_k_experts
             .or(self.num_experts_per_tok)
             .unwrap_or(8)
-    }
-
-    pub fn is_linear_layer(&self, layer_idx: usize) -> bool {
-        (layer_idx + 1) % self.full_attention_interval != 0
-    }
-
-    pub fn is_full_attention(&self, layer_idx: usize) -> bool {
-        match &self.layer_types {
-            Some(types) => types[layer_idx] == "full_attention",
-            None => !self.is_linear_layer(layer_idx),
-        }
-    }
-
-    pub fn rope_dims(&self) -> i32 {
-        (self.head_dim as f64 * self.partial_rotary_factor) as i32
     }
 
     /// Get RoPE config for a Gemma4 layer (rope_dims, rope_theta).
@@ -290,18 +224,4 @@ impl TextModelArgs {
         (dims, theta)
     }
 
-    /// Key dimension for linear attention: num_k_heads * key_head_dim
-    pub fn key_dim(&self) -> usize {
-        self.linear_num_key_heads * self.linear_key_head_dim
-    }
-
-    /// Value dimension for linear attention: num_v_heads * value_head_dim
-    pub fn value_dim(&self) -> usize {
-        self.linear_num_value_heads * self.linear_value_head_dim
-    }
-
-    /// Conv dimension for linear attention: key_dim*2 + value_dim
-    pub fn conv_dim(&self) -> usize {
-        self.key_dim() * 2 + self.value_dim()
-    }
 }

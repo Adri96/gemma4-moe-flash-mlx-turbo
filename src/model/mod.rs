@@ -1,6 +1,4 @@
-pub mod attention;
 pub mod gemma4_attention;
-pub mod gated_delta;
 pub mod mlp;
 pub mod moe;
 pub mod norm;
@@ -12,23 +10,17 @@ use std::time::Instant;
 use mlx_rs::error::Exception;
 use mlx_rs::Array;
 
-use crate::cache::{ArraysCache, Cache, KVCache};
-use crate::config::{ModelType, TextModelArgs};
+use crate::cache::{Cache, KVCache};
+use crate::config::TextModelArgs;
 use crate::memory::ExpertMemoryManager;
 use crate::perf::PerfStats;
-use attention::Attention;
 use gemma4_attention::Gemma4Attention;
-use gated_delta::GatedDeltaNet;
 use std::cell::RefCell;
-use mlp::{QuantizedLinear, GeLUMLP, MLP};
-use moe::{Gemma4MoeBlock, SparseMoeBlock, TransitionProfiler};
+use mlp::{QuantizedLinear, GeLUMLP};
+use moe::{Gemma4MoeBlock, TransitionProfiler};
 use norm::RMSNorm;
 
-// --- Qwen layer types ---
-
 pub enum AttentionLayer {
-    Linear(GatedDeltaNet),
-    Full(Attention),
     Gemma4(Gemma4Attention),
 }
 
@@ -50,24 +42,13 @@ pub struct DecoderLayer {
 }
 
 pub enum MoeVariant {
-    Qwen(SparseMoeBlock),
     Gemma4(Gemma4MoeBlock),
 }
 
 impl DecoderLayer {
-    pub fn is_linear(&self) -> bool {
-        matches!(&self.attention, AttentionLayer::Linear(_))
-    }
-
-    pub fn is_gemma4(&self) -> bool {
-        matches!(&self.attention, AttentionLayer::Gemma4(_))
-    }
-
     pub fn kv_head_dim(&self) -> usize {
         match &self.attention {
-            AttentionLayer::Full(a) => a.head_dim,
             AttentionLayer::Gemma4(a) => a.head_dim,
-            AttentionLayer::Linear(_) => 0, // not used
         }
     }
 
@@ -80,39 +61,7 @@ impl DecoderLayer {
         perf: &PerfStats,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
-        if self.is_gemma4() {
-            self.forward_gemma4(x, mask, cache, mem, perf, tp)
-        } else {
-            self.forward_qwen(x, mask, cache, mem, perf, tp)
-        }
-    }
-
-    fn forward_qwen(
-        &mut self,
-        x: &Array,
-        mask: Option<&Array>,
-        cache: &mut Cache,
-        mem: &ExpertMemoryManager,
-        perf: &PerfStats,
-        tp: Option<&RefCell<TransitionProfiler>>,
-    ) -> Result<Array, Exception> {
-        let normed = self.input_layernorm.forward(x)?;
-        let attn_out = match &mut self.attention {
-            AttentionLayer::Linear(gdn) => {
-                gdn.forward(&normed, mask, cache.as_arrays_mut(), perf)?
-            }
-            AttentionLayer::Full(attn) => {
-                attn.forward(&normed, mask, cache.as_kv_mut())?
-            }
-            _ => unreachable!(),
-        };
-        let h = x + &attn_out;
-        let normed = self.post_attention_layernorm.forward(&h)?;
-        let mlp_out = match &self.mlp {
-            MoeVariant::Qwen(moe) => moe.forward(&normed, mem, perf, tp)?,
-            _ => unreachable!(),
-        };
-        Ok(&h + &mlp_out)
+        self.forward_gemma4(x, mask, cache, mem, perf, tp)
     }
 
     fn forward_gemma4(
@@ -128,10 +77,7 @@ impl DecoderLayer {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x)?;
         let h = match &mut self.attention {
-            AttentionLayer::Gemma4(attn) => {
-                attn.forward(&h, mask, cache.as_kv_mut())?
-            }
-            _ => unreachable!(),
+            AttentionLayer::Gemma4(attn) => attn.forward(&h, mask, cache.as_kv_mut())?,
         };
         let h = self.post_attention_layernorm.forward(&h)?;
         let h = &residual + &h;
@@ -155,7 +101,6 @@ impl DecoderLayer {
         let h2_input = self.pre_feedforward_layernorm_2.as_ref().unwrap().forward(&h)?;
         let h2 = match &self.mlp {
             MoeVariant::Gemma4(moe) => moe.forward(&h2_input, mem, perf, tp)?,
-            _ => unreachable!(),
         };
         let h2 = self.post_feedforward_layernorm_2.as_ref().unwrap().forward(&h2)?;
 
@@ -182,8 +127,6 @@ pub struct TextModel {
     pub embed_group_size: i32,
     pub layers: Vec<DecoderLayer>,
     pub norm: RMSNorm,
-    pub full_attention_interval: usize,
-    pub model_type: ModelType,
     pub embed_scale: Option<f32>,
 }
 
@@ -197,92 +140,50 @@ impl TextModel {
         speculate: bool,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
-        let hidden = match self.model_type {
-            ModelType::Qwen => {
-                let flat_ids = input_ids.flatten(None, None)?;
-                let w = mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?;
-                let s = mlx_rs::ops::indexing::take_axis(self.embed_tokens_scales.as_ref().unwrap(), &flat_ids, 0)?;
-                let b = mlx_rs::ops::indexing::take_axis(self.embed_tokens_biases.as_ref().unwrap(), &flat_ids, 0)?;
-                let hidden = mlx_rs::ops::dequantize(
-                    &w, &s, &b, Some(self.embed_group_size), Some(self.embed_bits),
-                )?;
-                let shape = input_ids.shape();
-                hidden.reshape(&[shape[0], shape[1], -1])?
-            }
-            ModelType::Gemma4 => {
-                let flat_ids = input_ids.flatten(None, None)?;
-                let h = if let Some(ref scales) = self.embed_tokens_scales {
-                    // Quantized embedding (UD models: 6-bit)
-                    let w = mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?;
-                    let s = mlx_rs::ops::indexing::take_axis(scales, &flat_ids, 0)?;
-                    let b = mlx_rs::ops::indexing::take_axis(self.embed_tokens_biases.as_ref().unwrap(), &flat_ids, 0)?;
-                    mlx_rs::ops::dequantize(
-                        &w, &s, &b, Some(self.embed_group_size), Some(self.embed_bits),
-                    )?
-                } else {
-                    // Non-quantized bf16 embedding
-                    mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?
-                };
-                let shape = input_ids.shape();
-                let h = h.reshape(&[shape[0], shape[1], -1])?;
-                // Scale by sqrt(hidden_size)
-                if let Some(scale) = self.embed_scale {
-                    let s = Array::from_f32(scale).as_dtype(h.dtype())?;
-                    &h * &s
-                } else {
-                    h
-                }
-            }
+        let flat_ids = input_ids.flatten(None, None)?;
+        let h = if let Some(ref scales) = self.embed_tokens_scales {
+            let w = mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?;
+            let s = mlx_rs::ops::indexing::take_axis(scales, &flat_ids, 0)?;
+            let b = mlx_rs::ops::indexing::take_axis(self.embed_tokens_biases.as_ref().unwrap(), &flat_ids, 0)?;
+            mlx_rs::ops::dequantize(&w, &s, &b, Some(self.embed_group_size), Some(self.embed_bits))?
+        } else {
+            mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?
+        };
+        let shape = input_ids.shape();
+        let h = h.reshape(&[shape[0], shape[1], -1])?;
+        let hidden = if let Some(scale) = self.embed_scale {
+            let s = Array::from_f32(scale).as_dtype(h.dtype())?;
+            &h * &s
+        } else {
+            h
         };
 
-        // Create attention masks
-        let (full_mask, sliding_mask) = match self.model_type {
-            ModelType::Qwen => {
-                let fa_idx = self.full_attention_interval - 1;
-                let fa_offset = cache[fa_idx].kv_offset();
-                let mask = create_attention_mask(&hidden, fa_offset)?;
-                (mask, None)
+        // Create attention masks (find first full and sliding layer offsets)
+        let mut full_offset = 0usize;
+        let mut sliding_offset = 0usize;
+        for (i, layer) in self.layers.iter().enumerate() {
+            if matches!(&layer.attention, AttentionLayer::Gemma4(a) if !a.use_k_eq_v) {
+                sliding_offset = cache[i].kv_offset();
+                break;
             }
-            ModelType::Gemma4 => {
-                // Find first full and first sliding attention layer for mask offsets
-                let mut full_offset = 0usize;
-                let mut sliding_offset = 0usize;
-                for (i, layer) in self.layers.iter().enumerate() {
-                    if matches!(&layer.attention, AttentionLayer::Gemma4(a) if !a.use_k_eq_v) {
-                        // Sliding attention layer (has v_proj)
-                        sliding_offset = cache[i].kv_offset();
-                        break;
-                    }
-                }
-                for (i, layer) in self.layers.iter().enumerate() {
-                    if matches!(&layer.attention, AttentionLayer::Gemma4(a) if a.use_k_eq_v) {
-                        // Full attention layer (K==V)
-                        full_offset = cache[i].kv_offset();
-                        break;
-                    }
-                }
-                let full_mask = create_attention_mask(&hidden, full_offset)?;
-                let sliding_mask = create_sliding_mask(&hidden, sliding_offset, self.layers[0].layer_scalar.is_some())?;
-                (full_mask, sliding_mask)
+        }
+        for (i, layer) in self.layers.iter().enumerate() {
+            if matches!(&layer.attention, AttentionLayer::Gemma4(a) if a.use_k_eq_v) {
+                full_offset = cache[i].kv_offset();
+                break;
             }
-        };
+        }
+        let full_mask = create_attention_mask(&hidden, full_offset)?;
+        let sliding_mask = create_sliding_mask(&hidden, sliding_offset)?;
 
         let mut h = hidden;
         let num_layers = self.layers.len();
 
         for i in 0..num_layers {
-            // Compute mask from layer info (immutable borrow, released before forward)
-            let mask = match self.model_type {
-                ModelType::Qwen => {
-                    if self.layers[i].is_linear() { None } else { full_mask.as_ref() }
-                }
-                ModelType::Gemma4 => {
-                    if matches!(&self.layers[i].attention, AttentionLayer::Gemma4(a) if a.use_k_eq_v) {
-                        full_mask.as_ref()
-                    } else {
-                        sliding_mask.as_ref().or(full_mask.as_ref())
-                    }
-                }
+            let mask = if matches!(&self.layers[i].attention, AttentionLayer::Gemma4(a) if a.use_k_eq_v) {
+                full_mask.as_ref()
+            } else {
+                sliding_mask.as_ref().or(full_mask.as_ref())
             };
             h = self.layers[i].forward(&h, mask, &mut cache[i], mem, perf, tp)?;
             // layers[i] mutable borrow released — can now access layers immutably
@@ -290,7 +191,7 @@ impl TextModel {
             let _t = Instant::now();
 
             // Level C GPU prediction: dense MLP + next attention + next router (lazy)
-            let lazy_pred = if speculate && i + 1 < num_layers && self.model_type == ModelType::Gemma4 {
+            let lazy_pred = if speculate && i + 1 < num_layers {
                 let h_pa = tp.and_then(|r| r.borrow_mut().h_post_attn.take());
                 if let Some(h_pa) = h_pa {
                     let next_mask = match &self.layers[i + 1].attention {
@@ -368,22 +269,16 @@ impl TextModel {
         }
 
         // Layer L+1's attention on h_approx (speculative, no cache mutation)
-        let router_input = if let AttentionLayer::Gemma4(ref attn) = layer_l1.attention {
-            if let Some(kv_cache) = cache_l1.as_kv_ref() {
-                if let Some(cached_kv) = kv_cache.peek_kv() {
-                    // Full Level C: attention with virtual KV append
-                    let normed = layer_l1.input_layernorm.forward(&h_approx)?;
-                    let attn_out = attn.forward_speculative(
-                        &normed, mask, Some(cached_kv), kv_cache.offset(),
-                    )?;
-                    let attn_out = layer_l1.post_attention_layernorm.forward(&attn_out)?;
-                    &h_approx + &attn_out
-                } else {
-                    // Cache empty (first token) — skip attention
-                    h_approx
-                }
+        let AttentionLayer::Gemma4(ref attn) = layer_l1.attention;
+        let router_input = if let Some(kv_cache) = cache_l1.as_kv_ref() {
+            if let Some(cached_kv) = kv_cache.peek_kv() {
+                let normed = layer_l1.input_layernorm.forward(&h_approx)?;
+                let attn_out = attn.forward_speculative(
+                    &normed, mask, Some(cached_kv), kv_cache.offset(),
+                )?;
+                let attn_out = layer_l1.post_attention_layernorm.forward(&attn_out)?;
+                &h_approx + &attn_out
             } else {
-                // Quantized KV cache — fall back to Level A.5 (skip attention)
                 h_approx
             }
         } else {
@@ -391,7 +286,8 @@ impl TextModel {
         };
 
         // Layer L+1's router
-        if let MoeVariant::Gemma4(ref moe) = layer_l1.mlp {
+        let MoeVariant::Gemma4(ref moe) = layer_l1.mlp;
+        {
             let x2 = &router_input * &router_input;
             let mean = mlx_rs::ops::mean_axes(&x2, &[-1], Some(true))?;
             let eps = Array::from_f32(moe.rms_norm_eps);
@@ -408,8 +304,6 @@ impl TextModel {
             let parts = mlx_rs::ops::split_sections(&top, &[12i32], Some(-1))?;
             let predicted = parts[0].as_dtype(mlx_rs::Dtype::Int32)?.reshape(&[-1])?;
             Ok(Some(predicted))
-        } else {
-            Ok(None)
         }
     }
 }
@@ -434,36 +328,19 @@ impl Model {
     ) -> Result<Array, Exception> {
         let out = self.model.forward(input_ids, cache, mem, perf, speculate, tp)?;
         let logits = if self.tie_word_embeddings {
-            match self.model.model_type {
-                ModelType::Qwen => {
-                    mlx_rs::ops::quantized_matmul(
-                        &out,
-                        &self.model.embed_tokens_weight,
-                        self.model.embed_tokens_scales.as_ref().unwrap(),
-                        self.model.embed_tokens_biases.as_ref().unwrap(),
-                        Some(true),
-                        Some(self.model.embed_group_size),
-                        Some(self.model.embed_bits),
-                    )?
-                }
-                ModelType::Gemma4 => {
-                    if self.model.embed_tokens_scales.is_some() {
-                        // Quantized embedding: use quantized_matmul
-                        mlx_rs::ops::quantized_matmul(
-                            &out,
-                            &self.model.embed_tokens_weight,
-                            self.model.embed_tokens_scales.as_ref().unwrap(),
-                            self.model.embed_tokens_biases.as_ref().unwrap(),
-                            Some(true),
-                            Some(self.model.embed_group_size),
-                            Some(self.model.embed_bits),
-                        )?
-                    } else {
-                        // Non-quantized embedding: matmul(out, weight.T)
-                        let w_t = mlx_rs::ops::transpose_axes(&self.model.embed_tokens_weight, &[1, 0])?.as_dtype(out.dtype())?;
-                        mlx_rs::ops::matmul(&out, &w_t)?
-                    }
-                }
+            if self.model.embed_tokens_scales.is_some() {
+                mlx_rs::ops::quantized_matmul(
+                    &out,
+                    &self.model.embed_tokens_weight,
+                    self.model.embed_tokens_scales.as_ref().unwrap(),
+                    self.model.embed_tokens_biases.as_ref().unwrap(),
+                    Some(true),
+                    Some(self.model.embed_group_size),
+                    Some(self.model.embed_bits),
+                )?
+            } else {
+                let w_t = mlx_rs::ops::transpose_axes(&self.model.embed_tokens_weight, &[1, 0])?.as_dtype(out.dtype())?;
+                mlx_rs::ops::matmul(&out, &w_t)?
             }
         } else {
             self.lm_head.forward(&out)?
@@ -484,17 +361,9 @@ impl Model {
         self.model
             .layers
             .iter()
-            .map(|layer| {
-                if layer.is_linear() {
-                    Cache::Arrays(ArraysCache::new(2))
-                } else {
-                    match kv_quant_bits {
-                        Some(bits) => Cache::KV(KVCache::new_quantized(
-                            layer.kv_head_dim(), bits,
-                        )),
-                        None => Cache::KV(KVCache::new()),
-                    }
-                }
+            .map(|layer| match kv_quant_bits {
+                Some(bits) => Cache::KV(KVCache::new_quantized(layer.kv_head_dim(), bits)),
+                None => Cache::KV(KVCache::new()),
             })
             .collect()
     }
@@ -502,160 +371,22 @@ impl Model {
 
 // --- Weight loading ---
 
-pub fn load_model(split_path: &Path, args: &TextModelArgs, quant: Option<&crate::config::QuantizationConfig>) -> anyhow::Result<Model> {
-    match args.model_type() {
-        ModelType::Qwen => load_qwen_model(split_path, args, quant),
-        ModelType::Gemma4 => load_gemma4_model(split_path, args, quant),
-    }
+pub fn load_model(split_path: &Path, args: &TextModelArgs, quant: Option<&crate::config::QuantizationConfig>, verbose: bool) -> anyhow::Result<Model> {
+    load_gemma4_model(split_path, args, quant, verbose)
 }
 
-fn load_qwen_model(split_path: &Path, args: &TextModelArgs, quant: Option<&crate::config::QuantizationConfig>) -> anyhow::Result<Model> {
-    eprintln!("Loading resident weights (Qwen)...");
+fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&crate::config::QuantizationConfig>, verbose: bool) -> anyhow::Result<Model> {
+    if verbose { eprintln!("Loading resident weights (Gemma4)..."); }
     let resident_path = split_path.join("resident/resident.safetensors");
     let weights = load_safetensors_map(&resident_path)?;
 
-    eprintln!(
-        "Loaded {} resident tensors ({:.2} GB)",
-        weights.len(),
-        weights.values().map(|a| a.nbytes()).sum::<usize>() as f64 / 1e9
-    );
-
-    let bits = quant.map(|q| q.bits as i32).unwrap_or(8);
-    let group_size = quant.map(|q| q.group_size as i32).unwrap_or(32);
-    eprintln!("  Quantization: {}-bit, group_size={}", bits, group_size);
-
-    let mut layers = Vec::with_capacity(args.num_hidden_layers);
-    for i in 0..args.num_hidden_layers {
-        let prefix = format!("model.layers.{}", i);
-
-        let input_ln = RMSNorm {
-            weight: get_weight(&weights, &format!("{}.input_layernorm.weight", prefix)),
-            eps: args.rms_norm_eps,
-        };
-        let post_ln = RMSNorm {
-            weight: get_weight(&weights, &format!("{}.post_attention_layernorm.weight", prefix)),
-            eps: args.rms_norm_eps,
-        };
-
-        let attention = if args.is_linear_layer(i) {
-            let p = format!("{}.linear_attn", prefix);
-            AttentionLayer::Linear(GatedDeltaNet {
-                in_proj_qkv: load_qlinear(&weights, &format!("{}.in_proj_qkv", p), bits, group_size),
-                in_proj_z: load_qlinear(&weights, &format!("{}.in_proj_z", p), bits, group_size),
-                in_proj_b: load_qlinear(&weights, &format!("{}.in_proj_b", p), bits, group_size),
-                in_proj_a: load_qlinear(&weights, &format!("{}.in_proj_a", p), bits, group_size),
-                out_proj: load_qlinear(&weights, &format!("{}.out_proj", p), bits, group_size),
-                conv1d_weight: get_weight(&weights, &format!("{}.conv1d.weight", p)),
-                norm: norm::RMSNormGated {
-                    weight: get_weight(&weights, &format!("{}.norm.weight", p)),
-                    eps: args.rms_norm_eps,
-                },
-                dt_bias: get_weight(&weights, &format!("{}.dt_bias", p)),
-                a_log: get_weight(&weights, &format!("{}.A_log", p)),
-                num_v_heads: args.linear_num_value_heads,
-                num_k_heads: args.linear_num_key_heads,
-                head_k_dim: args.linear_key_head_dim,
-                head_v_dim: args.linear_value_head_dim,
-                key_dim: args.key_dim(),
-                value_dim: args.value_dim(),
-                conv_kernel_size: args.linear_conv_kernel_dim,
-                conv_dim: args.conv_dim(),
-            })
-        } else {
-            let p = format!("{}.self_attn", prefix);
-            AttentionLayer::Full(Attention {
-                q_proj: load_qlinear(&weights, &format!("{}.q_proj", p), bits, group_size),
-                k_proj: load_qlinear(&weights, &format!("{}.k_proj", p), bits, group_size),
-                v_proj: load_qlinear(&weights, &format!("{}.v_proj", p), bits, group_size),
-                o_proj: load_qlinear(&weights, &format!("{}.o_proj", p), bits, group_size),
-                q_norm: RMSNorm {
-                    weight: get_weight(&weights, &format!("{}.q_norm.weight", p)),
-                    eps: args.rms_norm_eps,
-                },
-                k_norm: RMSNorm {
-                    weight: get_weight(&weights, &format!("{}.k_norm.weight", p)),
-                    eps: args.rms_norm_eps,
-                },
-                num_heads: args.num_attention_heads,
-                num_kv_heads: args.num_key_value_heads,
-                head_dim: args.head_dim,
-                rope_dims: args.rope_dims(),
-                rope_theta: args.rope_theta as f32,
-                scale: (args.head_dim as f32).powf(-0.5),
-            })
-        };
-
-        let mlp_prefix = format!("{}.mlp", prefix);
-        let mlp = MoeVariant::Qwen(SparseMoeBlock {
-            gate: load_qlinear(&weights, &format!("{}.gate", mlp_prefix), bits, group_size),
-            shared_expert: MLP {
-                gate_proj: load_qlinear(&weights, &format!("{}.shared_expert.gate_proj", mlp_prefix), bits, group_size),
-                up_proj: load_qlinear(&weights, &format!("{}.shared_expert.up_proj", mlp_prefix), bits, group_size),
-                down_proj: load_qlinear(&weights, &format!("{}.shared_expert.down_proj", mlp_prefix), bits, group_size),
-            },
-            shared_expert_gate: load_qlinear(&weights, &format!("{}.shared_expert_gate", mlp_prefix), bits, group_size),
-            top_k: args.experts_per_tok(),
-            norm_topk_prob: args.norm_topk_prob,
-            layer_idx: i,
-            bits,
-            group_size,
-        });
-
-        layers.push(DecoderLayer {
-            attention,
-            input_layernorm: input_ln,
-            post_attention_layernorm: post_ln,
-            mlp,
-            pre_feedforward_layernorm: None,
-            post_feedforward_layernorm: None,
-            post_feedforward_layernorm_1: None,
-            post_feedforward_layernorm_2: None,
-            pre_feedforward_layernorm_2: None,
-            dense_mlp: None,
-            layer_scalar: None,
-        });
-
-        if (i + 1) % 10 == 0 || i == args.num_hidden_layers - 1 {
-            eprintln!("  Built layer {}/{}", i + 1, args.num_hidden_layers);
-        }
+    if verbose {
+        eprintln!(
+            "Loaded {} resident tensors ({:.2} GB)",
+            weights.len(),
+            weights.values().map(|a| a.nbytes()).sum::<usize>() as f64 / 1e9
+        );
     }
-
-    let final_norm = RMSNorm {
-        weight: get_weight(&weights, "model.norm.weight"),
-        eps: args.rms_norm_eps,
-    };
-    let lm_head = load_qlinear(&weights, "lm_head", bits, group_size);
-
-    Ok(Model {
-        model: TextModel {
-            embed_tokens_weight: get_weight(&weights, "model.embed_tokens.weight"),
-            embed_tokens_scales: Some(get_weight(&weights, "model.embed_tokens.scales")),
-            embed_tokens_biases: Some(get_weight(&weights, "model.embed_tokens.biases")),
-            embed_bits: bits,
-            embed_group_size: group_size,
-            layers,
-            norm: final_norm,
-            full_attention_interval: args.full_attention_interval,
-            model_type: ModelType::Qwen,
-            embed_scale: None,
-        },
-        lm_head,
-        tie_word_embeddings: args.tie_word_embeddings,
-        head_dim: args.head_dim,
-        final_logit_softcapping: None,
-    })
-}
-
-fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&crate::config::QuantizationConfig>) -> anyhow::Result<Model> {
-    eprintln!("Loading resident weights (Gemma4)...");
-    let resident_path = split_path.join("resident/resident.safetensors");
-    let weights = load_safetensors_map(&resident_path)?;
-
-    eprintln!(
-        "Loaded {} resident tensors ({:.2} GB)",
-        weights.len(),
-        weights.values().map(|a| a.nbytes()).sum::<usize>() as f64 / 1e9
-    );
 
     let default_bits = quant.map(|q| q.bits as i32).unwrap_or(8);
     let default_gs = quant.map(|q| q.group_size as i32).unwrap_or(32);
@@ -669,11 +400,13 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
         }
     };
 
-    if has_overrides {
-        eprintln!("  Quantization: mixed-precision (default {}-bit, {} overrides)",
-            default_bits, quant.unwrap().overrides.len());
-    } else {
-        eprintln!("  Quantization: {}-bit, group_size={}", default_bits, default_gs);
+    if verbose {
+        if has_overrides {
+            eprintln!("  Quantization: mixed-precision (default {}-bit, {} overrides)",
+                default_bits, quant.unwrap().overrides.len());
+        } else {
+            eprintln!("  Quantization: {}-bit, group_size={}", default_bits, default_gs);
+        }
     }
 
     let layer_types = args.layer_types.as_ref().unwrap();
@@ -755,7 +488,6 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
             eps: args.rms_norm_eps,
         };
 
-        // Dense MLP — bits vary per layer for UD (3-5 bit)
         let mlp_prefix = format!("{}.mlp", prefix);
         let (mlp_bits, mlp_gs) = q_bits(&format!("{}.mlp.gate_proj", cfg_prefix));
         let dense_mlp = GeLUMLP {
@@ -798,7 +530,7 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
             layer_scalar,
         });
 
-        if (i + 1) % 10 == 0 || i == args.num_hidden_layers - 1 {
+        if verbose && ((i + 1) % 10 == 0 || i == args.num_hidden_layers - 1) {
             eprintln!("  Built layer {}/{}", i + 1, args.num_hidden_layers);
         }
     }
@@ -818,10 +550,12 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
         .cloned();
     let (embed_bits, embed_gs) = q_bits("language_model.model.embed_tokens");
 
-    if embed_scales.is_some() {
-        eprintln!("  Embedding: {}-bit quantized", embed_bits);
-    } else {
-        eprintln!("  Embedding: bf16 (unquantized)");
+    if verbose {
+        if embed_scales.is_some() {
+            eprintln!("  Embedding: {}-bit quantized", embed_bits);
+        } else {
+            eprintln!("  Embedding: bf16 (unquantized)");
+        }
     }
 
     // Dummy lm_head (not used when tie_word_embeddings=true)
@@ -842,8 +576,6 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
             embed_group_size: embed_gs,
             layers,
             norm: final_norm,
-            full_attention_interval: 1, // not used for Gemma4
-            model_type: ModelType::Gemma4,
             embed_scale: Some((args.hidden_size as f32).sqrt()),
         },
         lm_head: dummy_lm_head,
@@ -868,20 +600,6 @@ fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Array {
         .clone()
 }
 
-fn load_qlinear(
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-    bits: i32,
-    group_size: i32,
-) -> QuantizedLinear {
-    QuantizedLinear {
-        weight: get_weight(weights, &format!("{}.weight", prefix)),
-        scales: get_weight(weights, &format!("{}.scales", prefix)),
-        biases: get_weight(weights, &format!("{}.biases", prefix)),
-        bits,
-        group_size,
-    }
-}
 
 /// MLX Metal kernels only support these bit widths for quantized_matmul.
 const SUPPORTED_QUANT_BITS: &[i32] = &[2, 3, 4, 6, 8];
@@ -955,12 +673,9 @@ fn create_attention_mask(
     Ok(Some(additive))
 }
 
-/// Create a sliding window causal mask for Gemma4 sliding attention.
 fn create_sliding_mask(
     hidden: &Array,
     cache_offset: usize,
-    _has_sliding_window: bool,
 ) -> Result<Option<Array>, Exception> {
-    // For now, use standard causal mask (sliding window is only important for long sequences)
     create_attention_mask(hidden, cache_offset)
 }
