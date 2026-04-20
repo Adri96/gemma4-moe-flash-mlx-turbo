@@ -67,4 +67,19 @@ fn main() {
     }
 
     build.compile("ffi_zerocopy");
+
+    // mlx-sys objects use ___isPlatformVersionAtLeast from libclang_rt.osx.a,
+    // which Rust's linker skips (it uses -nodefaultlibs). Find and link it.
+    if let Ok(output) = std::process::Command::new("xcrun")
+        .args(["clang", "-print-file-name=libclang_rt.osx.a"])
+        .output()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() && path != "libclang_rt.osx.a" {
+            if let Some(dir) = std::path::Path::new(&path).parent() {
+                println!("cargo:rustc-link-search={}", dir.display());
+                println!("cargo:rustc-link-lib=static=clang_rt.osx");
+            }
+        }
+    }
 }
