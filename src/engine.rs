@@ -96,6 +96,10 @@ pub fn generate(
     let (think_open, think_close) = tokenizer.thinking_channel_tokens();
     let mut in_thinking = false;
     let mut in_ghost_zone = false;
+    // Cap consecutive ghost-zone skips so a structural marker followed by ordinary prose
+    // (lowercase tokens that fail is_structural_content_start) cannot trap output forever.
+    let mut ghost_skip_streak: u32 = 0;
+    const MAX_GHOST_SKIPS: u32 = 4;
     let mut visible_generated: Vec<u32> = Vec::new();
 
     let first_tok = next_token.item::<i32>() as u32;
@@ -108,8 +112,8 @@ pub fn generate(
         if !in_ghost_zone || is_structural_content_start(first_tok, tokenizer) {
             visible_generated.push(first_tok);
             in_ghost_zone = false;
+            if after_structural_marker(&visible_generated) { in_ghost_zone = true; }
         }
-        if after_structural_marker(&visible_generated) { in_ghost_zone = true; }
     }
     if debug_tokens {
         let tok_text = tokenizer.decode(&[first_tok]).unwrap_or_default();
@@ -157,9 +161,18 @@ pub fn generate(
             if !in_ghost_zone || is_structural_content_start(new_tok, tokenizer) {
                 visible_generated.push(new_tok);
                 in_ghost_zone = false;
+                ghost_skip_streak = 0;
+                // Re-enter ghost zone only when the just-pushed token completed a structural
+                // marker pair. Re-checking after a filtered token would keep ghost zone on
+                // forever, since visible_generated still ends with the same marker pair.
+                if after_structural_marker(&visible_generated) { in_ghost_zone = true; }
+            } else {
+                ghost_skip_streak += 1;
+                if ghost_skip_streak >= MAX_GHOST_SKIPS {
+                    in_ghost_zone = false;
+                    ghost_skip_streak = 0;
+                }
             }
-            // Re-enter ghost zone after each structural marker
-            if after_structural_marker(&visible_generated) { in_ghost_zone = true; }
         }
         if debug_tokens {
             let tok_text = tokenizer.decode(&[new_tok]).unwrap_or_default();
