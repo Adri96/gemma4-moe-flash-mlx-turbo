@@ -19,6 +19,7 @@ pub fn generate(
     max_tokens: usize,
     temperature: f32,
     top_p: f32,
+    rep_penalty: f32,
     mem: &ExpertMemoryManager,
     kv_quant_bits: Option<u8>,
     speculate: bool,
@@ -90,7 +91,7 @@ pub fn generate(
     let last_idx = Array::from_slice(&[seq_len - 1], &[1]);
     let last_logits = mlx_rs::ops::indexing::take_axis(&logits, &last_idx, 1)?;
     let last_logits = mlx_rs::ops::squeeze_axes(&last_logits, &[1])?;
-    let mut next_token = sample(&last_logits, temperature, top_p)?;
+    let mut next_token = sample(&last_logits, temperature, top_p, rep_penalty, &[])?;
     mlx_rs::transforms::eval(std::iter::once(&next_token))?;
 
     let (think_open, think_close) = tokenizer.thinking_channel_tokens();
@@ -143,7 +144,9 @@ pub fn generate(
         let input = Array::from_slice(&[tok_id as i32], &[1, 1]);
         let logits = model.forward(&input, &mut cache, mem, &perf, speculate, Some(&tp))?;
         let logits = mlx_rs::ops::squeeze_axes(&logits, &[1])?;
-        next_token = sample(&logits, temperature, top_p)?;
+        const REP_WINDOW: usize = 64;
+        let window_start = generated.len().saturating_sub(REP_WINDOW);
+        next_token = sample(&logits, temperature, top_p, rep_penalty, &generated[window_start..])?;
         mlx_rs::transforms::eval(std::iter::once(&next_token))?;
 
         tp.borrow_mut().end_token();
@@ -267,7 +270,33 @@ fn after_structural_marker(visible: &[u32]) -> bool {
     )
 }
 
-fn sample(logits: &Array, temperature: f32, top_p: f32) -> Result<Array, Exception> {
+fn sample(logits: &Array, temperature: f32, top_p: f32, rep_penalty: f32, recent_tokens: &[u32]) -> Result<Array, Exception> {
+    // Apply repetition penalty: divide positive logits, multiply negative logits.
+    // Materialises to f32 on CPU (one roundtrip) then rebuilds as bf16.
+    let penalized: Option<Array> = if rep_penalty > 1.0 && !recent_tokens.is_empty() {
+        let logits_f32 = logits.as_dtype(mlx_rs::Dtype::Float32)?;
+        mlx_rs::transforms::eval(std::iter::once(&logits_f32))?;
+        let src: &[f32] = logits_f32.as_slice();
+        let mut data = src.to_vec();
+        let shape: Vec<i32> = logits_f32.shape().iter().map(|&x| x as i32).collect();
+        let vocab_size = *shape.last().unwrap() as usize;
+        let offset = data.len() - vocab_size;
+        let mut seen = std::collections::HashSet::new();
+        for &tok in recent_tokens {
+            if seen.insert(tok) {
+                let idx = offset + tok as usize;
+                if idx < data.len() {
+                    if data[idx] >= 0.0 { data[idx] /= rep_penalty; } else { data[idx] *= rep_penalty; }
+                }
+            }
+        }
+        let arr = Array::from_slice(&data, &shape);
+        Some(arr.as_dtype(logits.dtype())?)
+    } else {
+        None
+    };
+    let logits: &Array = penalized.as_ref().unwrap_or(logits);
+
     if temperature == 0.0 {
         return mlx_rs::ops::indexing::argmax_axis(logits, -1, None);
     }

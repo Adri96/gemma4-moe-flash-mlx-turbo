@@ -72,6 +72,9 @@ enum Command {
         /// Print each generated token ID and text (for debugging output artifacts).
         #[arg(long)]
         debug_tokens: bool,
+        /// Repetition penalty applied to recently generated tokens (1.0 = disabled).
+        #[arg(long, default_value_t = 1.15)]
+        rep_penalty: f32,
         /// LRU expert page cache size (number of experts to keep warm in RAM).
         /// Each expert is ~3.35 MB. Without this flag all accessed experts accumulate
         /// in the OS page cache (up to 12-13 GB). Example: --expert-cache 500 (~1.68 GB).
@@ -111,6 +114,7 @@ fn main() -> anyhow::Result<()> {
             chat,
             debug_tokens,
             expert_cache,
+            rep_penalty,
         } => {
             let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
             // Load config
@@ -246,6 +250,7 @@ fn main() -> anyhow::Result<()> {
                 max_tokens,
                 temperature,
                 top_p,
+                rep_penalty,
                 &mem_mgr,
                 kv_quant_bits,
                 speculate,
@@ -289,6 +294,7 @@ fn main() -> anyhow::Result<()> {
                         max_tokens,
                         temperature,
                         top_p,
+                        rep_penalty,
                         &mem_mgr,
                         kv_quant_bits,
                         speculate,
