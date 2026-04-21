@@ -364,6 +364,9 @@ impl Gemma4MoeBlock {
         unique.sort();
         unique.dedup();
 
+        // Update LRU cache and queue evictions (flushed after GPU eval in TextModel::forward)
+        mem.notify_experts_used(self.layer_idx, &unique);
+
         // Reactive prefetch
         if is_decode && !*NOREACTIVE.get_or_init(|| std::env::var("NOREACTIVE").is_ok()) {
             let group = mem.prefetch_gcd_reactive(self.layer_idx, &unique);

@@ -243,6 +243,9 @@ impl TextModel {
             mlx_rs::transforms::eval(std::iter::once(&h))?;
             perf.acc(&perf.eval_wait, _tw.elapsed());
 
+            // GPU eval done: safe to release LRU-evicted expert pages from page cache
+            mem.flush_evictions(i);
+
             perf.acc(&perf.layer_eval, _t.elapsed());
         }
 

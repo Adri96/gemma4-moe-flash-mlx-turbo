@@ -17,7 +17,7 @@ The model is split into two parts:
 
 The bottleneck isn't compute — it's getting expert bytes from SSD to GPU before it stalls. Without explicit prefetch, the GPU triggers page faults that pull data in 16 KB chunks — synchronous kernel traps that reduce effective throughput to a fraction of what sequential reads achieve. flash-moe avoids this with a two-stage GCD prefetch pipeline:
 
-1. **Speculative** (during GPU eval): After submitting the current layer to the GPU, fire off low-priority (utility QoS) GCD workers to prefault pages for the *next* layer's predicted experts. Workers do prefault touch only (no `F_RDADVISE` / `madvise` — those issue kernel-level I/O that can't be cancelled).
+1. **Speculative** (during GPU eval): After submitting the current layer to the GPU, fire off low-priority (utility QoS) GCD workers to prefault pages for the _next_ layer's predicted experts. Workers do prefault touch only (no `F_RDADVISE` / `madvise` — those issue kernel-level I/O that can't be cancelled).
 2. **Reactive** (after routing): Once the router picks the actual 8 experts, cancel any in-flight speculative work (atomic flag — cancellable page-by-page), then dispatch high-priority (userInitiated QoS) workers with the full I/O pipeline (`F_RDADVISE` + `madvise` + prefault). Blocks until all pages are resident.
 3. **Eval** (zero faults): GPU reads from Metal buffers backed by already-resident mmap pages. Pure compute, no page faults.
 
@@ -33,9 +33,9 @@ Speculative prefetch needs to predict which experts the next layer will select. 
 
 ### Per-token I/O
 
-| Quant | Expert size | Active/layer | Layers | I/O per token |
-|-------|-------------|--------------|--------|---------------|
-| UD-4bit (mixed) | 3.35 MB | 26.8 MB | 30 | ~803 MB |
+| Quant           | Expert size | Active/layer | Layers | I/O per token |
+| --------------- | ----------- | ------------ | ------ | ------------- |
+| UD-4bit (mixed) | 3.35 MB     | 26.8 MB      | 30     | ~803 MB       |
 
 Unsloth's dynamic 4-bit quantization uses mixed precision (4-bit experts, 8-bit attention, 6-bit embedding) for better output quality than uniform 4-bit, with no ghost-token artifacts from quantization. Decode rate on a 16 GB M4 Mac mini is ~3–4 tok/s.
 
@@ -88,18 +88,19 @@ One-time step. You can delete the original download after splitting.
 
 ### Options
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--temperature` | 0.7 | Sampling temperature |
-| `--top-p` | 0.9 | Nucleus sampling threshold |
-| `--no-speculate` | off | Disable speculative prefetch for predicted experts |
-| `--warm-set` | off | Pread frequent experts into page cache at startup |
-| `--kv-quant-bits N` | 3 | TurboQuant KV cache: 2, 3, or 4-bit quantization |
-| `--no-kv-quant` | off | Disable KV cache quantization (plain bf16) |
-| `--stats` | off | Print per-phase perf breakdown after generation |
-| `--debug-tokens` | off | Print every generated token id + decoded text |
-| `--chat` | off | After the first prompt, accept follow-up turns from stdin |
-| `--calibrate N` | — | Record routing decisions over N tokens, save co-occurrence predictor |
+| Flag                | Default | Description                                                                   |
+| ------------------- | ------- | ----------------------------------------------------------------------------- |
+| `--temperature`     | 0.7     | Sampling temperature                                                          |
+| `--top-p`           | 0.9     | Nucleus sampling threshold                                                    |
+| `--no-speculate`    | off     | Disable speculative prefetch for predicted experts                            |
+| `--warm-set`        | off     | Pread frequent experts into page cache at startup                             |
+| `--kv-quant-bits N` | 3       | TurboQuant KV cache: 2, 3, or 4-bit quantization                              |
+| `--no-kv-quant`     | off     | Disable KV cache quantization (plain bf16)                                    |
+| `--stats`           | off     | Print per-phase perf breakdown after generation                               |
+| `--debug-tokens`    | off     | Print every generated token id + decoded text                                 |
+| `--chat`            | off     | After the first prompt, accept follow-up turns from stdin                     |
+| `--calibrate N`     | —       | Record routing decisions over N tokens, save co-occurrence predictor          |
+| `--expert-cache N`  | —       | Size of the expert cache. Each expert ≈ 3.35 MB, so N=150 keeps 500MB of them |
 
 ## Known issues
 

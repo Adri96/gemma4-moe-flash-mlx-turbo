@@ -40,7 +40,7 @@ enum Command {
         tokenizer_path: PathBuf,
         #[arg(long, default_value = "Hello")]
         prompt: String,
-        #[arg(long, default_value_t = 256)]
+        #[arg(long, default_value_t = 2048)]
         max_tokens: usize,
         #[arg(long, default_value_t = 0.7)]
         temperature: f32,
@@ -72,6 +72,11 @@ enum Command {
         /// Print each generated token ID and text (for debugging output artifacts).
         #[arg(long)]
         debug_tokens: bool,
+        /// LRU expert page cache size (number of experts to keep warm in RAM).
+        /// Each expert is ~3.35 MB. Without this flag all accessed experts accumulate
+        /// in the OS page cache (up to 12-13 GB). Example: --expert-cache 500 (~1.68 GB).
+        #[arg(long)]
+        expert_cache: Option<usize>,
     },
 }
 
@@ -105,6 +110,7 @@ fn main() -> anyhow::Result<()> {
             stats,
             chat,
             debug_tokens,
+            expert_cache,
         } => {
             let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
             // Load config
@@ -143,6 +149,16 @@ fn main() -> anyhow::Result<()> {
             let expert_dir = model_path.join("experts");
             if stats { eprintln!("Mapping expert files from {}...", expert_dir.display()); }
             let mut mem_mgr = memory::ExpertMemoryManager::new(&expert_dir, args.num_hidden_layers)?;
+            if let Some(cap) = expert_cache {
+                mem_mgr.set_expert_cache(cap);
+                if stats {
+                    eprintln!(
+                        "Expert LRU cache: {} experts (~{:.0} MB)",
+                        cap,
+                        cap as f64 * 3.35
+                    );
+                }
+            }
 
             // Load model FIRST (resident weights only — no expert arrays).
             // This allocates 2.76 GB of Metal buffers. Loading before warm set

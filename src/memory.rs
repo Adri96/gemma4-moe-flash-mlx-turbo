@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use memmap2::Mmap;
 use mlx_rs::{Array, Dtype};
@@ -81,6 +81,47 @@ pub struct SingleExpertTensors {
 
 // ── Async I/O prefetch ─────────────────────────────────────────────────────
 
+// ── LRU expert page cache ───────────────────────────────────────────────────
+
+/// Tracks which (layer, expert_idx) pairs are "warm" in the OS page cache.
+/// When over capacity, evicts the least-recently-used entry and returns it
+/// so the caller can issue madvise(MADV_DONTNEED).
+struct ExpertLruCache {
+    capacity: usize,
+    /// Front = most recently used, back = LRU
+    order: VecDeque<(usize, i32)>,
+    set: HashMap<(usize, i32), ()>,
+}
+
+impl ExpertLruCache {
+    fn new(capacity: usize) -> Self {
+        Self { capacity, order: VecDeque::new(), set: HashMap::new() }
+    }
+
+    /// Mark `indices` for `layer` as recently used.
+    /// Returns (layer, expert_idx) pairs to evict from the page cache.
+    fn touch(&mut self, layer: usize, indices: &[i32]) -> Vec<(usize, i32)> {
+        let mut to_evict = Vec::new();
+        for &idx in indices {
+            let key = (layer, idx);
+            if self.set.contains_key(&key) {
+                self.order.retain(|&k| k != key);
+                self.order.push_front(key);
+            } else {
+                self.order.push_front(key);
+                self.set.insert(key, ());
+                if self.order.len() > self.capacity {
+                    if let Some(evicted) = self.order.pop_back() {
+                        self.set.remove(&evicted);
+                        to_evict.push(evicted);
+                    }
+                }
+            }
+        }
+        to_evict
+    }
+}
+
 /// Manages expert files with direct pread() extraction.
 ///
 /// Supports both safetensors (72 preads/layer) and ECB (8 preads/layer) formats.
@@ -97,6 +138,10 @@ pub struct ExpertMemoryManager {
     // cancel_speculative() bumps it, causing stale workers to bail without affecting
     // the next batch.
     speculative_generation: Arc<AtomicUsize>,
+    /// LRU expert cache: tracks warm experts, evicts LRU when over capacity.
+    lru: Option<Mutex<ExpertLruCache>>,
+    /// Per-layer queue of (evict_layer, expert_idx) pairs to release after GPU eval.
+    pending_evict: Vec<Mutex<Vec<(usize, i32)>>>,
 }
 
 // ── F_RDADVISE FFI (macOS) ──────────────────────────────────────────────────
@@ -351,6 +396,7 @@ impl ExpertMemoryManager {
                 maps.push(mmap);
                 files.push(pread_file);
             }
+            let pending_evict = (0..num_layers).map(|_| Mutex::new(Vec::new())).collect();
             Ok(Self {
                 files,
                 maps,
@@ -359,6 +405,8 @@ impl ExpertMemoryManager {
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
                 speculative_generation: Arc::new(AtomicUsize::new(0)),
+                lru: None,
+                pending_evict,
             })
         } else {
             let mut st_offsets = Vec::with_capacity(num_layers);
@@ -371,6 +419,7 @@ impl ExpertMemoryManager {
                 maps.push(mmap);
                 files.push(File::open(&path)?);
             }
+            let pending_evict = (0..num_layers).map(|_| Mutex::new(Vec::new())).collect();
             Ok(Self {
                 files,
                 maps,
@@ -379,6 +428,8 @@ impl ExpertMemoryManager {
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
                 speculative_generation: Arc::new(AtomicUsize::new(0)),
+                lru: None,
+                pending_evict,
             })
         }
     }
@@ -401,6 +452,39 @@ impl ExpertMemoryManager {
     pub fn reset_cache_stats(&self) {}
     pub fn cache_size(&self) -> usize { 0 }
 
+    /// Enable LRU expert cache with the given capacity (number of experts to keep warm).
+    pub fn set_expert_cache(&mut self, capacity: usize) {
+        self.lru = Some(Mutex::new(ExpertLruCache::new(capacity)));
+    }
+
+    /// Called after routing: records which experts were used and queues any LRU evictions
+    /// to be flushed after the GPU eval for this layer completes.
+    pub fn notify_experts_used(&self, layer: usize, indices: &[i32]) {
+        let Some(ref lru_mutex) = self.lru else { return };
+        let to_evict = lru_mutex.lock().unwrap().touch(layer, indices);
+        if !to_evict.is_empty() {
+            *self.pending_evict[layer].lock().unwrap() = to_evict;
+        }
+    }
+
+    /// Called after eval(h): releases LRU-evicted expert pages from the OS page cache.
+    /// Only safe to call after GPU eval has completed for the triggering layer.
+    pub fn flush_evictions(&self, layer: usize) {
+        let ExpertFormat::Ecb(ref infos) = self.format else { return };
+        let to_evict = std::mem::take(&mut *self.pending_evict[layer].lock().unwrap());
+        if to_evict.is_empty() { return; }
+        const PAGE: usize = 16384; // Apple Silicon page size
+        for (evict_layer, eidx) in to_evict {
+            let info = &infos[evict_layer];
+            let map_ptr = self.maps[evict_layer].as_ptr() as usize;
+            let offset = info.data_start + eidx as usize * info.per_expert_stride;
+            let addr = (map_ptr + offset) & !(PAGE - 1);
+            let end = (map_ptr + offset + info.per_expert_stride + PAGE - 1) & !(PAGE - 1);
+            unsafe {
+                libc::madvise(addr as *mut libc::c_void, end - addr, libc::MADV_DONTNEED);
+            }
+        }
+    }
 
     /// Parallel pread to warm the page cache. Used at startup for warm set prefetch.
     pub fn pread_experts_sync(&self, layer: usize, expert_indices: &[i32]) {
