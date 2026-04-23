@@ -110,6 +110,76 @@ One-time step. You can delete the original download after splitting.
 | `--calibrate N`     | —       | Record routing decisions over N tokens, save co-occurrence predictor          |
 | `--expert-cache N`  | —       | LRU cap on warm experts. Each ≈ 3.35 MB, so N=500 keeps ~1.7 GB resident      |
 
+### 4. Serve (OpenAI-compatible API)
+
+Start an HTTP server that exposes an OpenAI-compatible API. Any tool that works with OpenAI can be pointed at this server by changing the base URL.
+
+```bash
+./target/release/flash-moe serve \
+  --model-path ./split_gemma4_ud4 \
+  --tokenizer-path ./gemma4-ud-4bit \
+  --port 11434
+```
+
+The server is now reachable at `http://localhost:11434/v1`.
+
+#### Endpoints
+
+| Method | Path                    | Description                          |
+| ------ | ----------------------- | ------------------------------------ |
+| GET    | `/v1/models`            | List available models                |
+| POST   | `/v1/chat/completions`  | Chat completions (streaming or not)  |
+| POST   | `/v1/completions`       | Legacy text completions              |
+
+Streaming is supported via SSE (`"stream": true`). Both endpoints accept any value in the `Authorization` header (the key is ignored).
+
+#### Serve options
+
+| Flag                | Default         | Description                                              |
+| ------------------- | --------------- | -------------------------------------------------------- |
+| `--host`            | 127.0.0.1       | Bind address. Use `0.0.0.0` for LAN access               |
+| `--port`            | 11434           | Listen port (11434 = Ollama default, 1234 = LM Studio)  |
+| `--model-id`        | flash-moe       | Model name reported to clients via `/v1/models`          |
+| `--kv-quant-bits N` | 3               | TurboQuant KV cache quantization (2, 3, or 4-bit)        |
+| `--no-kv-quant`     | off             | Disable KV cache quantization                            |
+| `--expert-cache N`  | —               | LRU cap on warm experts (≈ 3.35 MB each)                 |
+| `--warm-set`        | off             | Pread frequent experts into page cache at startup        |
+| `--rep-penalty`     | 1.15            | Repetition penalty applied to recent tokens              |
+
+#### Connecting ecosystem tools
+
+**Open WebUI** — set the OpenAI API URL to `http://localhost:11434/v1` and use any API key value.
+
+**Continue.dev** (VS Code / JetBrains) — add to `~/.continue/config.json`:
+```json
+{
+  "models": [{
+    "title": "Gemma 4 local",
+    "provider": "openai",
+    "model": "flash-moe",
+    "apiBase": "http://localhost:11434/v1",
+    "apiKey": "local"
+  }]
+}
+```
+
+**LiteLLM proxy**:
+```bash
+litellm --model openai/flash-moe --api_base http://localhost:11434/v1 --api_key local
+```
+
+**curl**:
+```bash
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local" \
+  -d '{
+    "model": "flash-moe",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
 ## Measuring memory footprint
 
 Memory accounting on Darwin has several counters that don't agree with each other, and picking the wrong one leads to confusing "my app is using 12 GB!" panics. Here's how to read the real numbers from flash-moe.

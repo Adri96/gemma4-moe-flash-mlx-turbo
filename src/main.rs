@@ -1,3 +1,4 @@
+mod api_types;
 mod cache;
 mod config;
 mod engine;
@@ -5,6 +6,7 @@ mod ffi;
 mod memory;
 mod model;
 mod perf;
+mod server;
 mod splitter;
 mod tokenizer;
 
@@ -31,6 +33,32 @@ enum Command {
         /// Expert file format (only "ecb" is supported)
         #[arg(long, default_value = "ecb")]
         format: String,
+    },
+    /// Start an OpenAI-compatible HTTP API server
+    Serve {
+        #[arg(long, default_value = "./split_gemma4_ud4")]
+        model_path: PathBuf,
+        #[arg(long, default_value = "./split_gemma4_ud4")]
+        tokenizer_path: PathBuf,
+        /// Host to bind (use 0.0.0.0 to allow LAN access)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on (11434 = Ollama default, 1234 = LM Studio default)
+        #[arg(long, default_value_t = 11434)]
+        port: u16,
+        /// Model ID reported to clients via /v1/models
+        #[arg(long, default_value = "flash-moe")]
+        model_id: String,
+        #[arg(long, default_value = "3")]
+        kv_quant_bits: Option<u8>,
+        #[arg(long)]
+        no_kv_quant: bool,
+        #[arg(long, default_value_t = 1.15)]
+        rep_penalty: f32,
+        #[arg(long)]
+        expert_cache: Option<usize>,
+        #[arg(long)]
+        warm_set: bool,
     },
     /// Generate text from a prompt
     Generate {
@@ -95,6 +123,69 @@ fn main() -> anyhow::Result<()> {
             eprintln!("Splitting model: {} → {} (format: {})", model_path.display(), output_path.display(), format);
             splitter::split_model(&model_path, &output_path, &format)?;
             eprintln!("Done.");
+        }
+
+        Command::Serve {
+            model_path,
+            tokenizer_path,
+            host,
+            port,
+            model_id,
+            kv_quant_bits,
+            no_kv_quant,
+            rep_penalty,
+            expert_cache,
+            warm_set,
+        } => {
+            let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
+
+            let config_path = model_path.join("config.json");
+            let (args, quant) = config::TextModelArgs::from_config_file(&config_path)?;
+
+            eprintln!("Loading tokenizer from {}...", tokenizer_path.display());
+            let tokenizer = tokenizer::QwenTokenizer::from_dir(&tokenizer_path)?;
+
+            let expert_dir = model_path.join("experts");
+            eprintln!("Mapping expert files from {}...", expert_dir.display());
+            let mut mem_mgr = memory::ExpertMemoryManager::new(&expert_dir, args.num_hidden_layers)?;
+            if let Some(cap) = expert_cache {
+                mem_mgr.set_expert_cache(cap);
+                eprintln!("Expert LRU cache: {} experts (~{:.0} MB)", cap, cap as f64 * 3.35);
+            }
+
+            eprintln!("Loading model from {}...", model_path.display());
+            let model = model::load_model(&model_path, &args, quant.as_ref(), true)?;
+
+            // Warm set prefetch (opt-in)
+            if warm_set {
+                let auto = model_path.join("warm_experts.json");
+                if auto.exists() {
+                    eprintln!("Prefetching warm set from {}...", auto.display());
+                    let warm: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&auto)?)?;
+                    let experts: Vec<(u32, u32)> = warm["experts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|pair| {
+                            let arr = pair.as_array().unwrap();
+                            (arr[0].as_u64().unwrap() as u32, arr[1].as_u64().unwrap() as u32)
+                        })
+                        .collect();
+                    mem_mgr.mlock_warm_set(&experts);
+                    mem_mgr.set_warm_set(&experts);
+                }
+            }
+
+            if let Some(bits) = kv_quant_bits {
+                eprintln!("TurboQuant KV cache: {}-bit", bits);
+            }
+            eprintln!("Model ready. Starting server...");
+
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(server::run(
+                &host, port, model, tokenizer, mem_mgr, model_id, kv_quant_bits, rep_penalty,
+            ))?;
         }
 
         Command::Generate {
@@ -258,6 +349,7 @@ fn main() -> anyhow::Result<()> {
                 recorder,
                 stats,
                 debug_tokens,
+                None,
             )?;
 
             // Save calibration results
@@ -302,6 +394,7 @@ fn main() -> anyhow::Result<()> {
                         None,
                         stats,
                         debug_tokens,
+                        None,
                     )?;
                     messages.push(tokenizer::ChatMessage {
                         role: "assistant".to_string(),

@@ -27,6 +27,7 @@ pub fn generate(
     recorder: Option<CalibrationRecorder>,
     verbose: bool,
     debug_tokens: bool,
+    mut on_token: Option<&mut dyn FnMut(&str)>,
 ) -> anyhow::Result<(String, Option<CalibrationRecorder>)> {
     let perf = PerfStats::new();
     let num_layers = model.model.layers.len();
@@ -123,8 +124,12 @@ pub fn generate(
 
     let mut stdout = std::io::stdout();
     let text = tokenizer.decode(&visible_generated)?;
-    print!("{}", text);
-    stdout.flush().ok();
+    if !text.is_empty() {
+        match on_token.as_mut() {
+            Some(f) => (*f)(&text),
+            None => { print!("{}", text); stdout.flush().ok(); }
+        }
+    }
 
     // Reset perf stats and cache stats for decode-only measurement
     perf.reset();
@@ -185,8 +190,11 @@ pub fn generate(
 
         let full_text = tokenizer.decode(&visible_generated)?;
         if full_text.len() > prev_text_len {
-            print!("{}", &full_text[prev_text_len..]);
-            stdout.flush().ok();
+            let delta = &full_text[prev_text_len..];
+            match on_token.as_mut() {
+                Some(f) => (*f)(delta),
+                None => { print!("{}", delta); stdout.flush().ok(); }
+            }
             prev_text_len = full_text.len();
         }
 
@@ -204,7 +212,7 @@ pub fn generate(
         }
     }
 
-    println!();
+    if on_token.is_none() { println!(); }
     let elapsed = t_start.elapsed().as_secs_f64();
     let rss_after_decode = crate::perf::current_rss_bytes();
     let rss_peak = crate::perf::peak_rss_bytes();
