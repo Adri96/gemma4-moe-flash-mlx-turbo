@@ -129,6 +129,7 @@ pub fn generate(
     // Reset perf stats and cache stats for decode-only measurement
     perf.reset();
     mem.reset_cache_stats();
+    let rss_before_decode = crate::perf::current_rss_bytes();
     let t_start = Instant::now();
     let mut t_interval = Instant::now();
     let mut tokens_generated = 0usize;
@@ -205,6 +206,8 @@ pub fn generate(
 
     println!();
     let elapsed = t_start.elapsed().as_secs_f64();
+    let rss_after_decode = crate::perf::current_rss_bytes();
+    let rss_peak = crate::perf::peak_rss_bytes();
     eprintln!(
         "{} tokens in {:.1}s ({:.1} tok/s)",
         tokens_generated, elapsed,
@@ -212,6 +215,14 @@ pub fn generate(
     );
     if verbose {
         eprintln!();
+
+        let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        let delta = rss_after_decode as i64 - rss_before_decode as i64;
+        let delta_mb = delta as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "RSS: {:.2} GB before decode → {:.2} GB after decode ({:+.0} MB), peak {:.2} GB",
+            gb(rss_before_decode), gb(rss_after_decode), delta_mb, gb(rss_peak)
+        );
 
         let (hits, misses, rate) = mem.take_hit_stats();
         if hits + misses > 0 {

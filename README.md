@@ -23,6 +23,14 @@ The bottleneck isn't compute — it's getting expert bytes from SSD to GPU befor
 
 Cancellation is what makes this work — without it, speculative I/O contends with reactive and throughput drops significantly.
 
+### Expert cache and page reclamation
+
+The OS page cache keeps expert pages warm across tokens, but on a 16 GB machine left to its own devices it can hold onto far more than the working set — every layer of decoding pulls 8 experts (~26 MB), and at a few tokens/s that's a fast lane to memory pressure. An optional bounded LRU (`--expert-cache N`) caps how many experts stay warm: on each routing decision it marks the current 8 experts as most-recently-used and evicts the LRU tail when over capacity. Evicted experts are released via `madvise(MADV_FREE)` on the page-aligned interior of each expert's region (edges straddle page boundaries with neighboring experts, so only fully-contained pages are advised). Release is deferred until after the layer's GPU eval completes so in-flight kernels aren't racing the reclamation.
+
+Two related fixes ship alongside the LRU: (1) the Metal buffer wrapper created by `newBufferWithBytesNoCopy` now releases properly on `MLX::array` drop — previously each expert load leaked an `MTL::Buffer` whose GPU registration kept the backing pages wired, defeating `madvise`; (2) eviction address math rounds start UP and end DOWN to PAGE boundaries so we never touch pages still owned by a live neighboring expert.
+
+With `--expert-cache 500` (~1.7 GB budget) you typically see 50 % LRU hit rate on a long decode, tens of thousands of cumulative evictions, and steady-state RSS of ~1.9 GB after the kernel reclaims the freed pool.
+
 ### Expert prediction
 
 Speculative prefetch needs to predict which experts the next layer will select. flash-moe uses **model-based prediction** rather than statistical tables:
@@ -92,15 +100,61 @@ One-time step. You can delete the original download after splitting.
 | ------------------- | ------- | ----------------------------------------------------------------------------- |
 | `--temperature`     | 0.7     | Sampling temperature                                                          |
 | `--top-p`           | 0.9     | Nucleus sampling threshold                                                    |
-| `--no-speculate`    | off     | Disable speculative prefetch for predicted experts                            |
+| `--no-speculate`    | —       | Kept for backwards compat; speculation is currently disabled unconditionally  |
 | `--warm-set`        | off     | Pread frequent experts into page cache at startup                             |
 | `--kv-quant-bits N` | 3       | TurboQuant KV cache: 2, 3, or 4-bit quantization                              |
 | `--no-kv-quant`     | off     | Disable KV cache quantization (plain bf16)                                    |
-| `--stats`           | off     | Print per-phase perf breakdown after generation                               |
+| `--stats`           | off     | Print per-phase perf breakdown, LRU stats, and RSS (before/after/peak)        |
 | `--debug-tokens`    | off     | Print every generated token id + decoded text                                 |
 | `--chat`            | off     | After the first prompt, accept follow-up turns from stdin                     |
 | `--calibrate N`     | —       | Record routing decisions over N tokens, save co-occurrence predictor          |
-| `--expert-cache N`  | —       | Size of the expert cache. Each expert ≈ 3.35 MB, so N=150 keeps 500MB of them |
+| `--expert-cache N`  | —       | LRU cap on warm experts. Each ≈ 3.35 MB, so N=500 keeps ~1.7 GB resident      |
+
+## Measuring memory footprint
+
+Memory accounting on Darwin has several counters that don't agree with each other, and picking the wrong one leads to confusing "my app is using 12 GB!" panics. Here's how to read the real numbers from flash-moe.
+
+### Built-in `--stats` output
+
+Running with `--stats` prints three RSS values at the end of decode:
+
+```
+RSS: 0.63 GB before decode → 1.73 GB after decode (+1122 MB), peak 3.77 GB
+```
+
+- **Before decode**: sampled right after prefill, before the first decode step. Represents loaded resident weights + prefill KV cache.
+- **After decode**: sampled at the end of generation. Usually *lower* than peak because the LRU has evicted experts accumulated during prefill.
+- **Peak**: `getrusage().ru_maxrss` — the high-water mark across the entire process lifetime. On macOS this is in bytes (unlike Linux which reports kilobytes).
+
+Both the before/after figures come from Mach's `task_info(MACH_TASK_BASIC_INFO)` which reports `resident_size` — the same counter `ps -o rss` samples.
+
+### Observing during a run
+
+While generation is running, in a second terminal:
+
+```bash
+# Instantaneous RSS (KB) — same counter as --stats
+ps -o pid,rss,vsz -p "$(pgrep -f flash-moe | head -1)"
+
+# Full breakdown of where pages live (resident, compressed, swapped, file-backed vs anonymous)
+vmmap "$(pgrep -f flash-moe | head -1)" | head -80
+
+# Speculative / purgeable queue sizes (system-wide, for context)
+vm_stat | grep -E "speculative|purgeable|compressed"
+```
+
+### Counter cheat sheet
+
+Different tools count different things. If numbers disagree, this is usually why:
+
+| Counter                                   | Tool                                       | What it includes                                              |
+| ----------------------------------------- | ------------------------------------------ | ------------------------------------------------------------- |
+| **RSS** (resident_size)                   | `ps -o rss`, Mach `task_info`, `--stats`  | Pages physically in RAM right now                             |
+| **phys_footprint**                        | Activity Monitor "Memory", `footprint`    | RSS + compressor pool + swap — i.e. RAM you're "billed" for   |
+| **Pages speculative** / **purgeable**     | `vm_stat`                                  | System-wide reclaimable pools (not per-process)               |
+| **Virtual size**                          | `ps -o vsz`                                | Total address-space mappings; meaningless for mmap'd files    |
+
+An mmap'd expert file that's been `MADV_FREE`'d shrinks RSS immediately but may still count under phys_footprint if the kernel hasn't reclaimed it yet, and will show as compressed (not RSS) once the compressor pool wakes up. On a 16 GB machine with low other-app pressure you should typically see peak RSS around 3.5–4 GB and steady-state RSS drift down toward 1.8–2.2 GB as the LRU evicts and the kernel reclaims. Activity Monitor's "Memory" column can read much higher because it shows phys_footprint — that's expected and doesn't mean pages are wired to RAM.
 
 ## Known issues
 
