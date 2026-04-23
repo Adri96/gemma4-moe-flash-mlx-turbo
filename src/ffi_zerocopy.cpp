@@ -37,11 +37,19 @@ extern "C" mlx_array mlx_array_from_mmap(
     // Wrap as allocator::Buffer (just a void* holding MTL::Buffer*)
     auto buf = mlx::core::allocator::Buffer(mtl_buf);
 
-    // No-op deleter: mmap lifetime exceeds array lifetime
-    auto noop = [](mlx::core::allocator::Buffer) {};
+    // Release the MTL::Buffer when the MLX array is dropped. The underlying
+    // mmap memory is owned by ExpertMemoryManager; we only release the Metal
+    // wrapper object (retain count from newBuffer(..., nullptr) = +1). Without
+    // this, every expert load leaks a MTL::Buffer whose GPU registration keeps
+    // the backing pages wired, defeating madvise(MADV_DONTNEED) eviction.
+    auto release_mtl_buf = [](mlx::core::allocator::Buffer b) {
+        if (auto* mtl = static_cast<MTL::Buffer*>(b.ptr())) {
+            mtl->release();
+        }
+    };
 
     std::vector<int> cpp_shape(shape, shape + dim);
     auto cpp_dtype = mlx_dtype_to_cpp(dtype);
 
-    return mlx_array_new_(mlx::core::array(buf, cpp_shape, cpp_dtype, noop));
+    return mlx_array_new_(mlx::core::array(buf, cpp_shape, cpp_dtype, release_mtl_buf));
 }
