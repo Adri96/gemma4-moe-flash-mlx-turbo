@@ -99,14 +99,17 @@ impl ExpertLruCache {
     }
 
     /// Mark `indices` for `layer` as recently used.
-    /// Returns (layer, expert_idx) pairs to evict from the page cache.
-    fn touch(&mut self, layer: usize, indices: &[i32]) -> Vec<(usize, i32)> {
+    /// Returns (hits, evictions) where evictions are (layer, expert_idx) pairs
+    /// to release from the page cache.
+    fn touch(&mut self, layer: usize, indices: &[i32]) -> (usize, Vec<(usize, i32)>) {
+        let mut hits = 0usize;
         let mut to_evict = Vec::new();
         for &idx in indices {
             let key = (layer, idx);
             if self.set.contains_key(&key) {
                 self.order.retain(|&k| k != key);
                 self.order.push_front(key);
+                hits += 1;
             } else {
                 self.order.push_front(key);
                 self.set.insert(key, ());
@@ -118,7 +121,7 @@ impl ExpertLruCache {
                 }
             }
         }
-        to_evict
+        (hits, to_evict)
     }
 }
 
@@ -142,6 +145,12 @@ pub struct ExpertMemoryManager {
     lru: Option<Mutex<ExpertLruCache>>,
     /// Per-layer queue of (evict_layer, expert_idx) pairs to release after GPU eval.
     pending_evict: Vec<Mutex<Vec<(usize, i32)>>>,
+    /// LRU telemetry (diagnostic — only meaningful when lru is enabled).
+    lru_touches: AtomicUsize,
+    lru_hits: AtomicUsize,
+    lru_evictions: AtomicUsize,
+    lru_pages_advised: AtomicUsize,
+    lru_madvise_errs: AtomicUsize,
 }
 
 // ── F_RDADVISE FFI (macOS) ──────────────────────────────────────────────────
@@ -407,6 +416,11 @@ impl ExpertMemoryManager {
                 speculative_generation: Arc::new(AtomicUsize::new(0)),
                 lru: None,
                 pending_evict,
+                lru_touches: AtomicUsize::new(0),
+                lru_hits: AtomicUsize::new(0),
+                lru_evictions: AtomicUsize::new(0),
+                lru_pages_advised: AtomicUsize::new(0),
+                lru_madvise_errs: AtomicUsize::new(0),
             })
         } else {
             let mut st_offsets = Vec::with_capacity(num_layers);
@@ -430,6 +444,11 @@ impl ExpertMemoryManager {
                 speculative_generation: Arc::new(AtomicUsize::new(0)),
                 lru: None,
                 pending_evict,
+                lru_touches: AtomicUsize::new(0),
+                lru_hits: AtomicUsize::new(0),
+                lru_evictions: AtomicUsize::new(0),
+                lru_pages_advised: AtomicUsize::new(0),
+                lru_madvise_errs: AtomicUsize::new(0),
             })
         }
     }
@@ -461,29 +480,70 @@ impl ExpertMemoryManager {
     /// to be flushed after the GPU eval for this layer completes.
     pub fn notify_experts_used(&self, layer: usize, indices: &[i32]) {
         let Some(ref lru_mutex) = self.lru else { return };
-        let to_evict = lru_mutex.lock().unwrap().touch(layer, indices);
+        let (hits, to_evict) = lru_mutex.lock().unwrap().touch(layer, indices);
+        self.lru_touches.fetch_add(indices.len(), Ordering::Relaxed);
+        self.lru_hits.fetch_add(hits, Ordering::Relaxed);
         if !to_evict.is_empty() {
-            *self.pending_evict[layer].lock().unwrap() = to_evict;
+            // Append rather than overwrite — robustness against any re-entry, though
+            // in the current call pattern each layer's notify fires once per forward
+            // pass and is drained by flush_evictions afterward.
+            self.pending_evict[layer].lock().unwrap().extend(to_evict);
         }
     }
 
     /// Called after eval(h): releases LRU-evicted expert pages from the OS page cache.
     /// Only safe to call after GPU eval has completed for the triggering layer.
+    ///
+    /// Alignment: per_expert_stride isn't a multiple of PAGE, so expert boundaries
+    /// straddle pages. Round start UP and end DOWN so we only touch pages fully
+    /// contained in the evicted expert's region — never the neighbour's pages,
+    /// which may belong to an expert that's currently loaded/active.
+    ///
+    /// Uses MADV_FREE rather than MADV_DONTNEED: on Darwin, MADV_DONTNEED maps to
+    /// VM_SYNC_DEACTIVATE (inactive-list hint, pages stay resident until pressure),
+    /// while MADV_FREE maps to VM_SYNC_KILLPAGES which actually removes pages from
+    /// the VM map. For our read-only file-backed SHARED mmap, the next access
+    /// re-faults them from the file — which is exactly the LRU contract.
     pub fn flush_evictions(&self, layer: usize) {
         let ExpertFormat::Ecb(ref infos) = self.format else { return };
         let to_evict = std::mem::take(&mut *self.pending_evict[layer].lock().unwrap());
         if to_evict.is_empty() { return; }
         const PAGE: usize = 16384; // Apple Silicon page size
-        for (evict_layer, eidx) in to_evict {
-            let info = &infos[evict_layer];
-            let map_ptr = self.maps[evict_layer].as_ptr() as usize;
-            let offset = info.data_start + eidx as usize * info.per_expert_stride;
-            let addr = (map_ptr + offset) & !(PAGE - 1);
-            let end = (map_ptr + offset + info.per_expert_stride + PAGE - 1) & !(PAGE - 1);
-            unsafe {
-                libc::madvise(addr as *mut libc::c_void, end - addr, libc::MADV_DONTNEED);
+        let mut pages_advised = 0usize;
+        let mut errs = 0usize;
+        for (evict_layer, eidx) in &to_evict {
+            let info = &infos[*evict_layer];
+            let map_ptr = self.maps[*evict_layer].as_ptr() as usize;
+            let offset = info.data_start + *eidx as usize * info.per_expert_stride;
+            let raw_start = map_ptr + offset;
+            let raw_end = raw_start + info.per_expert_stride;
+            let addr = (raw_start + PAGE - 1) & !(PAGE - 1); // round UP
+            let end = raw_end & !(PAGE - 1);                 // round DOWN
+            if end <= addr { continue; }
+            let len = end - addr;
+            let rc = unsafe {
+                libc::madvise(addr as *mut libc::c_void, len, libc::MADV_FREE)
+            };
+            if rc != 0 {
+                errs += 1;
+            } else {
+                pages_advised += len / PAGE;
             }
         }
+        self.lru_evictions.fetch_add(to_evict.len(), Ordering::Relaxed);
+        self.lru_pages_advised.fetch_add(pages_advised, Ordering::Relaxed);
+        self.lru_madvise_errs.fetch_add(errs, Ordering::Relaxed);
+    }
+
+    /// Returns (touches, hits, evictions, pages_advised, madvise_errs) and resets counters.
+    pub fn take_lru_stats(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.lru_touches.swap(0, Ordering::Relaxed),
+            self.lru_hits.swap(0, Ordering::Relaxed),
+            self.lru_evictions.swap(0, Ordering::Relaxed),
+            self.lru_pages_advised.swap(0, Ordering::Relaxed),
+            self.lru_madvise_errs.swap(0, Ordering::Relaxed),
+        )
     }
 
     /// Parallel pread to warm the page cache. Used at startup for warm set prefetch.

@@ -230,6 +230,16 @@ pub fn generate(
             );
         }
 
+        let (touches, hits, evictions, pages_advised, madvise_errs) = mem.take_lru_stats();
+        if touches > 0 {
+            let rate = if touches > 0 { hits as f64 / touches as f64 } else { 0.0 };
+            let mb_advised = pages_advised as f64 * 16384.0 / 1e6;
+            eprintln!(
+                "LRU expert cache: {:.1}% hit rate ({}/{} touches), {} evictions, {:.0} MB madvised, {} madvise errs",
+                rate * 100.0, hits, touches, evictions, mb_advised, madvise_errs
+            );
+        }
+
         perf.report(tokens_generated);
         tp.borrow().report();
     }
