@@ -155,7 +155,3 @@ Some identifiers still use the old model names even though Qwen support has been
 ### Env vars for testing:
 
 -   `NOREACTIVE=1` — skip reactive blocking pread (for A/B testing).
-
-### Known issues
-
--   **Generation stalls after ~220 tokens**: output stops appearing on stdout even though the loop keeps running. Multiple past debug sessions attributed this variously to the ghost-zone filter in `engine.rs`, KV cache growth + TurboQuant, and EOS handling. As of the most recent pass the root cause is still open — see `memory/` for the running investigation log.

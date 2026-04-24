@@ -1,9 +1,12 @@
+use std::time::Instant;
+
 use mlx_rs::error::Exception;
 use mlx_rs::Array;
 
 use crate::cache::KVCache;
 use crate::model::mlp::QuantizedLinear;
 use crate::model::norm::{RMSNorm, RMSNormNoScale};
+use crate::perf::PerfStats;
 
 /// Gemma4 attention layer (both sliding and full attention).
 ///
@@ -35,6 +38,7 @@ impl Gemma4Attention {
         x: &Array,
         mask: Option<&Array>,
         cache: &mut KVCache,
+        perf: &PerfStats,
     ) -> Result<Array, Exception> {
         let b = x.dim(0);
         let l = x.dim(1);
@@ -78,9 +82,10 @@ impl Gemma4Attention {
         )?;
 
         // KV cache update
-        let (keys, values) = cache.update_and_fetch(keys, values)?;
+        let (keys, values) = cache.update_and_fetch(keys, values, perf)?;
 
         // SDPA with scale=1.0
+        let t_sdpa = Instant::now();
         let output = if let Some(m) = mask {
             mlx_rs::fast::scaled_dot_product_attention(
                 &queries, &keys, &values, 1.0,
@@ -92,6 +97,8 @@ impl Gemma4Attention {
                 None::<mlx_rs::fast::ScaledDotProductAttentionMask>,
             )?
         };
+        mlx_rs::transforms::eval(std::iter::once(&output))?;
+        perf.acc(&perf.sdpa_eval, t_sdpa.elapsed());
 
         // Transpose back: [B, L, num_heads * head_dim]
         let output = mlx_rs::ops::transpose_axes(&output, &[0, 2, 1, 3])?;

@@ -77,7 +77,7 @@ impl DecoderLayer {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x)?;
         let h = match &mut self.attention {
-            AttentionLayer::Gemma4(attn) => attn.forward(&h, mask, cache.as_kv_mut())?,
+            AttentionLayer::Gemma4(attn) => attn.forward(&h, mask, cache.as_kv_mut(), perf)?,
         };
         let h = self.post_attention_layernorm.forward(&h)?;
         let h = &residual + &h;
@@ -159,12 +159,13 @@ impl TextModel {
             h
         };
 
-        // Create attention masks (find first full and sliding layer offsets)
+        // Create attention masks. Sliding layers cap stored K/V at `sliding_window`,
+        // so the mask's column count is `stored_len + seq_len`, not `offset + seq_len`.
         let mut full_offset = 0usize;
-        let mut sliding_offset = 0usize;
+        let mut sliding_stored = 0usize;
         for (i, layer) in self.layers.iter().enumerate() {
             if matches!(&layer.attention, AttentionLayer::Gemma4(a) if !a.use_k_eq_v) {
-                sliding_offset = cache[i].kv_offset();
+                sliding_stored = cache[i].kv_stored_len();
                 break;
             }
         }
@@ -175,7 +176,7 @@ impl TextModel {
             }
         }
         let full_mask = create_attention_mask(&hidden, full_offset)?;
-        let sliding_mask = create_sliding_mask(&hidden, sliding_offset, self.sliding_window)?;
+        let sliding_mask = create_sliding_mask(&hidden, sliding_stored, self.sliding_window)?;
 
         let mut h = hidden;
         let num_layers = self.layers.len();
@@ -362,12 +363,24 @@ impl Model {
     }
 
     pub fn make_cache(&self, kv_quant_bits: Option<u8>) -> Vec<Cache> {
+        let sliding_window = self.model.sliding_window;
         self.model
             .layers
             .iter()
-            .map(|layer| match kv_quant_bits {
-                Some(bits) => Cache::KV(KVCache::new_quantized(layer.kv_head_dim(), bits)),
-                None => Cache::KV(KVCache::new()),
+            .map(|layer| {
+                // Only local (non-K==V) attention layers use the sliding window.
+                let window = match &layer.attention {
+                    AttentionLayer::Gemma4(a) if !a.use_k_eq_v => sliding_window,
+                    _ => None,
+                };
+                match kv_quant_bits {
+                    Some(bits) => Cache::KV(KVCache::new_quantized_with_window(
+                        layer.kv_head_dim(),
+                        bits,
+                        window,
+                    )),
+                    None => Cache::KV(KVCache::new_with_window(window)),
+                }
             })
             .collect()
     }
@@ -678,32 +691,42 @@ fn create_attention_mask(
     Ok(Some(additive))
 }
 
-/// Sliding-window causal mask: position i attends to j iff j <= i AND i - j < window.
-/// When `window` is None, falls back to a plain causal mask.
+/// Sliding-window causal mask over a (possibly truncated) KV buffer.
+///
+/// `stored_len` is the number of already-cached K positions *before* appending
+/// the current `seq_len` tokens, so the mask has `stored_len + seq_len` columns
+/// matching the K returned by `KVCache::update_and_fetch`. Row `i` corresponds
+/// to the new token at relative position `stored_len + i`; col `j` to relative
+/// position `j`. The mask allows `j <= stored_len + i` (causal) and
+/// `(stored_len + i) - j < window` (sliding).
+///
+/// When `window` is None, falls back to a plain causal mask (delegating to
+/// `create_attention_mask`, whose `cache_offset` parameter has the same meaning
+/// as `stored_len` for unbounded caches).
 fn create_sliding_mask(
     hidden: &Array,
-    cache_offset: usize,
+    stored_len: usize,
     window: Option<usize>,
 ) -> Result<Option<Array>, Exception> {
     let seq_len = hidden.dim(1) as usize;
     if seq_len == 0 {
         return Ok(None);
     }
-    let total_len = cache_offset + seq_len;
     let Some(window) = window else {
-        return create_attention_mask(hidden, cache_offset);
+        return create_attention_mask(hidden, stored_len);
     };
-    // Single-token decode with everything inside the window: no mask needed.
+    let total_len = stored_len + seq_len;
+    // Single-token decode with every stored col in-window: no mask needed.
     if seq_len == 1 && total_len <= window {
         return Ok(None);
     }
 
     let rows = Array::from_iter(
-        (cache_offset as i32)..(total_len as i32),
+        (stored_len as i32)..(total_len as i32),
         &[seq_len as i32, 1],
     );
     let cols = Array::from_iter(0..(total_len as i32), &[1, total_len as i32]);
-    // Causal: j <= i
+    // Causal: j <= i (relative)
     let causal = rows.ge(&cols)?;
     // Window: i - j < window  ⇔  j > i - window
     let window_arr = Array::from_int(window as i32);

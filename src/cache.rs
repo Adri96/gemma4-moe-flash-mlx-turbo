@@ -1,5 +1,9 @@
+use std::time::Instant;
+
 use mlx_rs::error::Exception;
 use mlx_rs::Array;
+
+use crate::perf::PerfStats;
 
 /// Generate normalized Hadamard matrix H_n (Sylvester construction).
 /// H * H^T = I. n must be a power of 2.
@@ -136,6 +140,17 @@ fn concat_or_init(cached: &Option<Array>, new: Array) -> Result<Array, Exception
     }
 }
 
+/// Keep the last `window` positions along axis 2. No-op if input is already small enough.
+fn tail_along_time(full: &Array, window: usize) -> Result<Array, Exception> {
+    let len = full.dim(2) as usize;
+    if len <= window {
+        return Ok(full.clone());
+    }
+    let cut = (len - window) as i32;
+    let parts = mlx_rs::ops::split_sections(full, &[cut], Some(2))?;
+    Ok(parts[1].clone())
+}
+
 /// Immutable quantization constants shared across all cache entries.
 struct TurboQuantConfig {
     codebook: Array,
@@ -147,11 +162,17 @@ struct TurboQuantConfig {
     eps: Array,
 }
 
-/// KV cache for full attention layers (10 of 40).
+/// KV cache for a single attention layer.
 /// Supports both plain bf16 storage and TurboQuant compression.
+/// When `window` is Some(W), stored K/V is capped at the last W positions
+/// (sliding-window attention); `offset` still advances monotonically so RoPE
+/// sees absolute positions.
 pub struct KVCache {
     inner: KVCacheInner,
+    /// Total tokens seen so far (monotonic). Used as RoPE offset.
     offset: usize,
+    /// When Some, cap stored K/V to the last `window` positions after each update.
+    window: Option<usize>,
 }
 
 enum KVCacheInner {
@@ -168,16 +189,25 @@ enum KVCacheInner {
 
 impl KVCache {
     pub fn new() -> Self {
+        Self::new_with_window(None)
+    }
+
+    pub fn new_with_window(window: Option<usize>) -> Self {
         Self {
             inner: KVCacheInner::Plain {
                 keys: None,
                 values: None,
             },
             offset: 0,
+            window,
         }
     }
 
     pub fn new_quantized(head_dim: usize, bits: u8) -> Self {
+        Self::new_quantized_with_window(head_dim, bits, None)
+    }
+
+    pub fn new_quantized_with_window(head_dim: usize, bits: u8, window: Option<usize>) -> Self {
         let (centroids, bounds) = lloyd_max_codebook(bits);
         let (rotation, rotation_t) = build_rht(head_dim);
 
@@ -196,11 +226,23 @@ impl KVCache {
                 },
             },
             offset: 0,
+            window,
         }
     }
 
+    /// Monotonic position count (for RoPE). Not the stored cache length.
     pub fn offset(&self) -> usize {
         self.offset
+    }
+
+    /// Actual number of positions held in the stored K/V buffer.
+    /// Equals `offset()` for unbounded caches; capped at `window` otherwise.
+    pub fn stored_len(&self) -> usize {
+        let k = match &self.inner {
+            KVCacheInner::Plain { keys, .. } => keys.as_ref(),
+            KVCacheInner::Quantized { keys, .. } => keys.as_ref(),
+        };
+        k.map(|a| a.dim(2) as usize).unwrap_or(0)
     }
 
     /// Read cached K/V without mutating. Returns None if empty.
@@ -219,11 +261,20 @@ impl KVCache {
     }
 
     /// Store new keys/values and return all cached K/V for SDPA.
+    ///
+    /// The *returned* (k, v) always include every newly-appended token (so the
+    /// current SDPA call sees its own context). The *stored* (k, v) may be
+    /// truncated to the last `window` positions when sliding-window attention
+    /// is configured, so subsequent calls only pay memory + compute for the
+    /// window.
     pub fn update_and_fetch(
         &mut self,
         keys: Array,
         values: Array,
+        perf: &PerfStats,
     ) -> Result<(Array, Array), Exception> {
+        let new_len = keys.dim(2) as usize;
+
         match &mut self.inner {
             KVCacheInner::Plain {
                 keys: cached_keys,
@@ -231,9 +282,13 @@ impl KVCache {
             } => {
                 let k = concat_or_init(cached_keys, keys)?;
                 let v = concat_or_init(cached_values, values)?;
-                self.offset = k.dim(2) as usize;
-                *cached_keys = Some(k.clone());
-                *cached_values = Some(v.clone());
+                self.offset += new_len;
+                let (stored_k, stored_v) = match self.window {
+                    Some(w) => (tail_along_time(&k, w)?, tail_along_time(&v, w)?),
+                    None => (k.clone(), v.clone()),
+                };
+                *cached_keys = Some(stored_k);
+                *cached_values = Some(stored_v);
                 Ok((k, v))
             }
 
@@ -242,14 +297,21 @@ impl KVCache {
                 values: cached_values,
                 config,
             } => {
+                let t = Instant::now();
                 let (new_k, new_v) = turbo_round_trip_kv(&keys, &values, config)?;
+                mlx_rs::transforms::eval([&new_k, &new_v].into_iter())?;
+                perf.acc(&perf.kv_quant_eval, t.elapsed());
 
                 let k = concat_or_init(cached_keys, new_k)?;
                 let v = concat_or_init(cached_values, new_v)?;
 
-                self.offset = k.dim(2) as usize;
-                *cached_keys = Some(k.clone());
-                *cached_values = Some(v.clone());
+                self.offset += new_len;
+                let (stored_k, stored_v) = match self.window {
+                    Some(w) => (tail_along_time(&k, w)?, tail_along_time(&v, w)?),
+                    None => (k.clone(), v.clone()),
+                };
+                *cached_keys = Some(stored_k);
+                *cached_values = Some(stored_v);
                 Ok((k, v))
             }
         }
@@ -276,6 +338,12 @@ impl Cache {
     pub fn kv_offset(&self) -> usize {
         match self {
             Cache::KV(kv) => kv.offset(),
+        }
+    }
+
+    pub fn kv_stored_len(&self) -> usize {
+        match self {
+            Cache::KV(kv) => kv.stored_len(),
         }
     }
 }
