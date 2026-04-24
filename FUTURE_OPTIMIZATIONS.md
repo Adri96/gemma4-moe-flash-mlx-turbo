@@ -210,21 +210,57 @@ for ~25 greedy tokens before diverging — expected bf16 accumulation-order
 drift from the flash kernel, not a bug. τ=1e-4 produces coherent summaries
 on the 900-token test prompt. No held-out perplexity run yet.
 
-**Open follow-ups (pick up next session):**
+**τ sweep at 2K–8K context (measured 2026-04-24, `sweep_tau.sh`, M4 base 16 GB):**
 
-1. **τ sweep at 2K–8K context** with a coherent prompt set. Measured points
-   above are promising but sparse; paper's headline (+22.8%) is at 32K, and
-   the curve between 2K and that is unprofiled here. Candidates:
-   `τ ∈ {5e-5, 1e-4, 3e-4, 1e-3}`. Goal: find the highest τ that holds
-   quality (compare top-1 agreement vs baseline at greedy, or ppl on a
-   held-out set).
-2. **Consider extending to prefill** — only worth it for very long prompts
-   (8K+) where flash-attention's softmax tiling starts competing with the
-   sparsity savings. Today's hybrid gate (`l == 1`) is the right default;
-   revisit if chunked prefill (#3) lands and typical prefill chunks shrink
-   to window-size (1024).
-3. **If TurboQuant is ever migrated to packed-integer V** (see #2 in the
-   pending list), sparse-V's dequant-skipping benefit — the paper's actual
-   mechanism — becomes realizable, and the headline gain should widen.
-   Currently V is stored bf16 post-round-trip, so we only get the
-   matmul-shape win, not the dequant-skip win.
+15 runs: τ ∈ {0.0, 5e-5, 1e-4, 3e-4, 1e-3} × {2K, 4K, 8K} prompt tokens,
+80 decode tokens each, TurboQuant 3-bit KV, temperature 0.7.
+
+**Finding: overall tok/s is a misleading metric at long context.** After a
+3.8K or 7.7K prefill, expert pages are largely evicted, so decode tokens 1–10
+always run at 0.4–1.0 tok/s (SSD cold) regardless of τ. Tokens 11–70 then
+run warm at 3.5–4.7 tok/s. Overall tok/s conflates cold ramp with steady
+state. Warm-state averages (tokens 11–79) are the correct signal.
+
+Overall tok/s (reported by engine summary line):
+
+| Context | baseline | τ=5e-5 | τ=1e-4 | τ=3e-4 | τ=1e-3 |
+|---------|----------|--------|--------|--------|--------|
+| 2K      | 3.9      | 3.8    | 4.0    | 3.9    | 4.0    |
+| 4K      | 2.8      | 2.5    | 2.9    | 2.9    | 2.5    |
+| 8K      | 2.0      | 2.1    | 2.0    | 1.9    | 2.1    |
+
+Warm-state tok/s (per-10-token windows, cold window excluded):
+
+| Context | baseline | τ=5e-5 | τ=1e-4     | τ=3e-4      | τ=1e-3 |
+|---------|----------|--------|------------|-------------|--------|
+| 2K      | 3.71     | 3.43   | **3.71** 0%| 3.57 −4%    | 3.57   |
+| 4K      | 3.33     | 3.00   | 3.50 +5%   | **3.83 +15%**| 3.17  |
+| 8K      | 3.83     | 3.83   | **4.00 +4%**| 3.83 0%   | 3.67   |
+
+**τ=1e-4 confirmed as safe default.** No regression at any tested context;
++5% at 4K, +4% at 8K warm-state. τ=3e-4 shows a larger 4K gain but regresses
+at 2K — probably too aggressive for general use. τ=5e-5 and τ=1e-3 both hurt
+at 4K.
+
+**The headline gain isn't here yet.** At 2K–8K, SSD expert I/O still
+dominates. Gemma 4 has only 6 full-attention layers × 2 global KV heads ×
+head_dim=512; the V-matmul savings from sparsity are small relative to
+~803 MB/token expert load. The paper's +22.8% is at 32K context where
+attention compute overtakes I/O. Warm-state gains (~4%) are real but modest.
+
+**Practical guidance:**
+- Keep `--sparse-v-threshold 0.0` (disabled) as default.
+- Enable `--sparse-v-threshold 1e-4` for multi-turn chat where the page cache
+  is already warm (continued conversation, not first decode after long prefill).
+- Revisit with 16K–32K prompts once chunked prefill (#3) lands, since smaller
+  chunks will reduce post-prefill eviction and give a fairer picture.
+
+**Remaining follow-ups:**
+
+1. **τ sweep at 16K–32K context** — the paper's regime. Requires chunked
+   prefill (#3) to avoid OOM; blocked on that.
+2. **Consider extending to prefill** — revisit only if chunked prefill lands
+   and typical prefill chunks shrink to window-size (1024).
+3. **If TurboQuant is migrated to packed-integer V** (see #2 in the pending
+   list), the dequant-skip mechanism becomes realizable and the headline gain
+   should widen significantly.
