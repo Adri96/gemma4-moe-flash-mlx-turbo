@@ -362,6 +362,16 @@ impl Model {
         }
     }
 
+    /// Enable TurboQuant §5 sparse-V attention gating at decode.
+    /// `threshold = 0.0` disables it (default). Typical value: 1e-4.
+    pub fn set_sparse_v_threshold(&mut self, threshold: f32) {
+        for layer in self.model.layers.iter_mut() {
+            match &mut layer.attention {
+                AttentionLayer::Gemma4(a) => a.sparse_v_threshold = threshold,
+            }
+        }
+    }
+
     pub fn make_cache(&self, kv_quant_bits: Option<u8>) -> Vec<Cache> {
         let sliding_window = self.model.sliding_window;
         self.model
@@ -481,6 +491,7 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
             rope_dims,
             rope_theta,
             use_k_eq_v,
+            sparse_v_threshold: 0.0,
         });
 
         // Feedforward norms

@@ -10,37 +10,13 @@ Already landed (reference, not to redo):
 - Expert speculation (Level B CPU + Level C GPU + co-occurrence) — `src/model/moe.rs`, `src/memory.rs`
 - Zero-copy mmap via `newBufferWithBytesNoCopy` — `src/ffi_zerocopy.cpp`
 - Unsloth UD mixed-precision quantization — `src/config.rs`
-- **Sliding-window KV truncation** (this session) — `src/cache.rs`, `src/model/mod.rs`
+- Sliding-window KV truncation — `src/cache.rs`, `src/model/mod.rs`
+- **Sparse-V attention gating (TurboQuant §5, hybrid by phase)** (this session) —
+  `src/model/gemma4_attention.rs`, gated on `--sparse-v-threshold` (see findings below).
 
 ---
 
-## 1. Sparse-V attention gating (TurboQuant §5)
-
-**What.** At decode time, zero out V rows whose attention weight falls below a
-threshold before the SDPA `softmax(QK) · V` gather. The TurboQuant paper
-reports +22.8% decode speed at 32K with Δppl ≈ 0.000 on Gemma 4.
-
-**Why it stacks with what's in the tree.** The 3-bit quantized V stays in
-cache; sparse-V only skips the gather for positions the row would have
-contributed negligibly to. Orthogonal axis from bit-width compression.
-
-**Where.** `src/model/gemma4_attention.rs::forward`. The `mlx_rs::fast::scaled_dot_product_attention`
-call hides QK/softmax/gather behind one op — we lose the ability to threshold
-inside it. Two options:
-- (a) Drop the fused SDPA for a manual `softmax(QK/scale + mask) · V` so we can
-  threshold between softmax and gather.
-- (b) Pre-compute an attention-weight mask in a separate pass, then call SDPA
-  with V zeroed at low-attention rows. Extra pass but keeps the fused kernel.
-
-**Catch.** The per-row threshold needs to be small enough to preserve quality
-(paper uses ~1e-4). Easy to break quality if set too aggressively — validate on
-a held-out prompt set.
-
-**Expected gain.** +15–25% decode at long contexts. Negligible at short context.
-
----
-
-## 2. Token-level speculative decoding + MoE-Spec verification
+## 1. Token-level speculative decoding + MoE-Spec verification
 
 **What.** A small draft model (e.g. Gemma 3 270M, dense) proposes k tokens; the
 main model verifies in parallel. On MoE this normally regresses because the
@@ -74,7 +50,7 @@ since we're SSD-bound there.
 
 ---
 
-## 3. Reduce TurboQuant round-trip cost (or drop it)
+## 2. Reduce TurboQuant round-trip cost (or drop it)
 
 **Status.** Measured 2026-04-24. The current tree has **no inline eval** in
 `update_and_fetch` — the round-trip is already lazy and folds into the next
@@ -119,7 +95,7 @@ is already tens of MB; the feature is accuracy-oriented, not memory-oriented.
 
 ---
 
-## 4. Chunked prefill
+## 3. Chunked prefill
 
 **What.** Currently `TextModel::forward` processes the whole prompt in one
 pass. Long prompts (2K+) materialize full-size Q/K/V tensors per layer, causing
@@ -140,7 +116,7 @@ chat.
 
 ---
 
-## 5. Persisted co-occurrence table
+## 4. Persisted co-occurrence table
 
 **What.** `CooccurrencePredictor` is rebuilt per session (see
 `src/model/moe.rs::CooccurrencePredictor`). Calibration once on a diverse
@@ -198,3 +174,57 @@ implementation:
   kernel receives bf16 K/V directly (no dequant on read path — the
   `Quantized` cache also stores bf16). Nothing to implement; the win is
   already banked.
+
+---
+
+## Landed this session: Sparse-V (findings + follow-ups)
+
+**Approach taken.** Hybrid by phase: prefill keeps the fused SDPA (flash
+kernel's online softmax + tiled QK are load-bearing at long `L`); decode
+(`l == 1`) switches to a manual `softmax(Q @ K^T + mask) → where(w ≥ τ, w, 0) @ V`
+when `τ > 0`. Option (a) from the original brief, scoped to decode only.
+See `src/model/gemma4_attention.rs::sparse_v_attention`.
+
+**GQA must use broadcast, not `repeat_axis`.** First cut expanded K/V along
+the head axis via `repeat_axis`; at 1.6K context this regressed decode by
+**-18%**. Full-attn layers have `num_groups=8` (num_heads=16, num_kv_heads=2),
+so the copy was ≈300 MB/tok across the 6 full layers. The fused SDPA avoids
+this with a 5-D broadcast trick. Reshape `Q → [B, Hkv, Hg, 1, D]` and
+`K, V → [B, Hkv, 1, D, T] / [B, Hkv, 1, T, D]`; matmul broadcasts the `Hg`
+axis. Zero copies. Flipped −18% → +12.5% at ~900-token coherent context.
+
+**Measured tok/s (greedy, M4 base 16 GB, Gemma 4 UD-4bit, TurboQuant 3-bit KV):**
+
+| Context    | Baseline | τ = 1e-4 | Δ       |
+|------------|----------|----------|---------|
+| ~85 tok    | 6.8      | 6.5      | −4%     |
+| ~930 tok   | 4.0      | 4.5      | **+12.5%** |
+| ~1.65K tok | 4.9      | 5.1      | +4%     |
+
+Crossover sits in the few-hundred-token range. Below it the manual path's
+lack of kernel fusion costs more than the gating saves; above it, gating
+wins. Default is `--sparse-v-threshold 0.0` (disabled) — users opt in.
+
+**Quality sanity check.** τ=1e-30 (manual path, no gating) matches baseline
+for ~25 greedy tokens before diverging — expected bf16 accumulation-order
+drift from the flash kernel, not a bug. τ=1e-4 produces coherent summaries
+on the 900-token test prompt. No held-out perplexity run yet.
+
+**Open follow-ups (pick up next session):**
+
+1. **τ sweep at 2K–8K context** with a coherent prompt set. Measured points
+   above are promising but sparse; paper's headline (+22.8%) is at 32K, and
+   the curve between 2K and that is unprofiled here. Candidates:
+   `τ ∈ {5e-5, 1e-4, 3e-4, 1e-3}`. Goal: find the highest τ that holds
+   quality (compare top-1 agreement vs baseline at greedy, or ppl on a
+   held-out set).
+2. **Consider extending to prefill** — only worth it for very long prompts
+   (8K+) where flash-attention's softmax tiling starts competing with the
+   sparsity savings. Today's hybrid gate (`l == 1`) is the right default;
+   revisit if chunked prefill (#3) lands and typical prefill chunks shrink
+   to window-size (1024).
+3. **If TurboQuant is ever migrated to packed-integer V** (see #2 in the
+   pending list), sparse-V's dequant-skipping benefit — the paper's actual
+   mechanism — becomes realizable, and the headline gain should widen.
+   Currently V is stored bf16 post-round-trip, so we only get the
+   matmul-shape win, not the dequant-skip win.

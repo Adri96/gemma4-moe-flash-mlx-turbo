@@ -59,6 +59,9 @@ enum Command {
         expert_cache: Option<usize>,
         #[arg(long)]
         warm_set: bool,
+        /// TurboQuant §5 sparse-V gating threshold at decode. 0.0 disables.
+        #[arg(long, default_value_t = 0.0)]
+        sparse_v_threshold: f32,
     },
     /// Generate text from a prompt
     Generate {
@@ -108,6 +111,11 @@ enum Command {
         /// in the OS page cache (up to 12-13 GB). Example: --expert-cache 500 (~1.68 GB).
         #[arg(long)]
         expert_cache: Option<usize>,
+        /// TurboQuant §5 sparse-V gating threshold applied at decode only.
+        /// Zeros weights < τ after softmax before the V gather. 0.0 = disabled.
+        /// Paper uses ~1e-4 for Δppl ≈ 0.
+        #[arg(long, default_value_t = 0.0)]
+        sparse_v_threshold: f32,
     },
 }
 
@@ -136,6 +144,7 @@ fn main() -> anyhow::Result<()> {
             rep_penalty,
             expert_cache,
             warm_set,
+            sparse_v_threshold,
         } => {
             let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
 
@@ -154,7 +163,12 @@ fn main() -> anyhow::Result<()> {
             }
 
             eprintln!("Loading model from {}...", model_path.display());
-            let model = model::load_model(&model_path, &args, quant.as_ref(), true)?;
+            let mut model = model::load_model(&model_path, &args, quant.as_ref(), true)?;
+
+            if sparse_v_threshold > 0.0 {
+                model.set_sparse_v_threshold(sparse_v_threshold);
+                eprintln!("Sparse-V gating: τ = {:.2e} (decode only)", sparse_v_threshold);
+            }
 
             // Warm set prefetch (opt-in)
             if warm_set {
@@ -206,6 +220,7 @@ fn main() -> anyhow::Result<()> {
             debug_tokens,
             expert_cache,
             rep_penalty,
+            sparse_v_threshold,
         } => {
             let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
             // Load config
@@ -260,6 +275,11 @@ fn main() -> anyhow::Result<()> {
             // prefetch ensures madvise pages aren't evicted by weight allocation.
             if stats { eprintln!("Loading model from {}...", model_path.display()); }
             let mut model = model::load_model(&model_path, &args, quant.as_ref(), stats)?;
+
+            if sparse_v_threshold > 0.0 {
+                model.set_sparse_v_threshold(sparse_v_threshold);
+                if stats { eprintln!("Sparse-V gating: τ = {:.2e} (decode only)", sparse_v_threshold); }
+            }
 
             // Prefetch warm set into page cache AFTER model loading
             let warm_path = warm_experts

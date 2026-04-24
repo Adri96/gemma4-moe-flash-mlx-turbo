@@ -27,6 +27,9 @@ pub struct Gemma4Attention {
     pub rope_dims: i32,
     pub rope_theta: f32,
     pub use_k_eq_v: bool,
+    /// If > 0, at decode (l==1) use a manual softmax(QK)+mask → where(w<τ,0,w) · V path
+    /// instead of the fused SDPA, so low-weight V rows contribute 0. 0.0 disables.
+    pub sparse_v_threshold: f32,
 }
 
 impl Gemma4Attention {
@@ -80,8 +83,15 @@ impl Gemma4Attention {
         // KV cache update
         let (keys, values) = cache.update_and_fetch(keys, values)?;
 
-        // SDPA with scale=1.0
-        let output = if let Some(m) = mask {
+        // Hybrid path: at decode (l==1) with sparse-V enabled, run a manual
+        // softmax(Q @ K^T + mask) → gate-by-threshold → @ V. Prefill keeps the
+        // fused SDPA (which is MLX's flash-attention kernel — we'd lose
+        // tiled QK and online softmax otherwise, and sparse-V has no benefit
+        // there anyway). Gemma 4 uses SDPA scale=1.0 literally.
+        let decode_sparse = l == 1 && self.sparse_v_threshold > 0.0;
+        let output = if decode_sparse {
+            sparse_v_attention(&queries, &keys, &values, mask, self.num_heads, self.num_kv_heads, self.sparse_v_threshold)?
+        } else if let Some(m) = mask {
             mlx_rs::fast::scaled_dot_product_attention(
                 &queries, &keys, &values, 1.0,
                 mlx_rs::fast::ScaledDotProductAttentionMask::Array(m),
@@ -169,4 +179,56 @@ impl Gemma4Attention {
         let output = output.reshape(&[b, l, -1])?;
         self.o_proj.forward(&output)
     }
+}
+
+/// TurboQuant §5 sparse-V attention for decode (Q is length-1).
+///
+/// Shapes (decode):
+///   queries: [B, num_heads,    1, D]
+///   keys:    [B, num_kv_heads, T, D]
+///   values:  [B, num_kv_heads, T, D]
+///   mask (if Some): additive [1, 1, 1, T]
+///
+/// GQA via 5-D reshape+broadcast (not `repeat_axis`): copying K/V costs
+/// hundreds of MB/tok at 1K+ context on Gemma 4's full-attn layers
+/// (num_groups=8), more than the sparsity saves. The fused SDPA we skip
+/// here does the same broadcast trick internally.
+fn sparse_v_attention(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    mask: Option<&Array>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    threshold: f32,
+) -> Result<Array, Exception> {
+    let b = queries.dim(0);
+    let d = queries.dim(3);
+    let hkv = num_kv_heads as i32;
+    let hg = (num_heads / num_kv_heads) as i32;
+
+    // Q: [B, H, 1, D] → [B, Hkv, Hg, 1, D]
+    let q5 = queries.reshape(&[b, hkv, hg, 1, d])?;
+    // K: [B, Hkv, T, D] → [B, Hkv, 1, D, T] (transpose last two, add groups dim)
+    let k_t = mlx_rs::ops::transpose_axes(keys, &[0, 1, 3, 2])?; // [B, Hkv, D, T]
+    let k5 = mlx_rs::ops::expand_dims(&k_t, 2)?;                 // [B, Hkv, 1, D, T]
+    // V: [B, Hkv, T, D] → [B, Hkv, 1, T, D]
+    let v5 = mlx_rs::ops::expand_dims(values, 2)?;
+
+    // Q @ K^T via broadcast over Hg → [B, Hkv, Hg, 1, T]
+    let mut scores = mlx_rs::ops::matmul(&q5, &k5)?;
+    if let Some(m) = mask {
+        scores = &scores + m;
+    }
+
+    let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+
+    let tau = Array::from_f32(threshold).as_dtype(weights.dtype())?;
+    let keep = weights.ge(&tau)?;
+    let zero = Array::from_f32(0.0).as_dtype(weights.dtype())?;
+    let weights = mlx_rs::ops::which(&keep, &weights, &zero)?;
+
+    // weights @ V → [B, Hkv, Hg, 1, D]
+    let out5 = mlx_rs::ops::matmul(&weights, &v5)?;
+    out5.reshape(&[b, num_heads as i32, 1, d])
 }
