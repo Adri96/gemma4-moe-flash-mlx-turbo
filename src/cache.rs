@@ -1,9 +1,5 @@
-use std::time::Instant;
-
 use mlx_rs::error::Exception;
 use mlx_rs::Array;
-
-use crate::perf::PerfStats;
 
 /// Generate normalized Hadamard matrix H_n (Sylvester construction).
 /// H * H^T = I. n must be a power of 2.
@@ -271,7 +267,6 @@ impl KVCache {
         &mut self,
         keys: Array,
         values: Array,
-        perf: &PerfStats,
     ) -> Result<(Array, Array), Exception> {
         let new_len = keys.dim(2) as usize;
 
@@ -297,10 +292,7 @@ impl KVCache {
                 values: cached_values,
                 config,
             } => {
-                let t = Instant::now();
                 let (new_k, new_v) = turbo_round_trip_kv(&keys, &values, config)?;
-                mlx_rs::transforms::eval([&new_k, &new_v].into_iter())?;
-                perf.acc(&perf.kv_quant_eval, t.elapsed());
 
                 let k = concat_or_init(cached_keys, new_k)?;
                 let v = concat_or_init(cached_values, new_v)?;

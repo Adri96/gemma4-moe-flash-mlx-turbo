@@ -77,7 +77,7 @@ impl DecoderLayer {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x)?;
         let h = match &mut self.attention {
-            AttentionLayer::Gemma4(attn) => attn.forward(&h, mask, cache.as_kv_mut(), perf)?,
+            AttentionLayer::Gemma4(attn) => attn.forward(&h, mask, cache.as_kv_mut())?,
         };
         let h = self.post_attention_layernorm.forward(&h)?;
         let h = &residual + &h;

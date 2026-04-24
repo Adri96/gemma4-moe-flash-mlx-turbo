@@ -74,24 +74,48 @@ since we're SSD-bound there.
 
 ---
 
-## 3. Overlap `kv_quant_eval` with next-layer GPU submit
+## 3. Reduce TurboQuant round-trip cost (or drop it)
 
-**What.** `KVCache::update_and_fetch` evals the TurboQuant round-trip
-synchronously before returning. Visible as `perf.kv_quant_eval` (~18 ms/tok at
-1299 tokens, 7.5% of total). The eval happens inline; no reason it can't
-overlap with the next layer's async GPU submit.
+**Status.** Measured 2026-04-24. The current tree has **no inline eval** in
+`update_and_fetch` — the round-trip is already lazy and folds into the next
+`async_eval` boundary. The cost is the arithmetic itself, not a sync barrier.
 
-**Where.** `src/cache.rs::update_and_fetch` — remove the inline
-`mlx_rs::transforms::eval` in the Quantized branch, let the lazy graph reach
-the next `async_eval` boundary. Verify perf stats still split cleanly.
+**Measurement (71-token decode, Gemma 4 UD-4bit, M4 base 16 GB).** Instrumented
+with per-op `eval` barriers and buckets (`kv_quant_eval`, `sdpa_eval`), then
+reverted:
 
-**Catch.** The `eval` is there because the quantized K/V is then concatenated
-with the cached K/V. Concat of a lazy op isn't wrong; the eval just forces
-materialization for timing attribution. Dropping it means KV-quant time folds
-into the next layer's eval. That's fine for total latency but noisier stats.
+| Metric                | TurboQuant 3-bit | Plain bf16    |
+|-----------------------|------------------|---------------|
+| KV quant eval (ms/tok)| 18.6             | 0             |
+| SDPA eval (ms/tok)    | 13.7             | 22.1          |
+| Attention-related sum | **32.3**         | **22.1**      |
+| Wall clock (tok/s)    | 5.4              | **5.6**       |
 
-**Expected gain.** Up to ~7% of current decode time, likely less due to
-dependency chains.
+Note: the individual buckets are polluted by MLX lazy-graph attribution —
+upstream projections/RoPE fold into whichever bucket evals first. The *sum*
+is the clean comparison. TurboQuant adds ~10 ms/tok of real compute (~5% of
+a ~180 ms/tok budget). Wall-clock delta ~6 ms/tok confirms it, with some
+absorbed by overlap.
+
+**Why it costs anything.** The round-trip is rotate → boundary search →
+inverse rotate per new row — two `dim × dim` matmuls (dim = 256 or 512) + a
+codebook lookup, across all 30 layers. It's not the eval barrier; it's the ops.
+
+**Second finding.** The "Quantized" cache *stores bf16 after round-trip*, not
+packed integer codes. So TurboQuant as-shipped provides **no KV memory win** —
+only quantization noise (regularization-like). At 1K context the KV footprint
+is already tens of MB; the feature is accuracy-oriented, not memory-oriented.
+
+**Options, in order of effort.**
+- **Drop TurboQuant entirely** if the accuracy signal isn't load-bearing.
+  One-liner in `main.rs` (flip `--no-kv-quant` to default). Frees ~5% throughput.
+- **Pack integer codes in the cache** (a real project): change `Quantized`
+  storage to `[N, H, T, ceil(D·bits/8)]` byte arrays, write a custom Metal
+  kernel that dequants inside the attention tile. Gets the memory win
+  TurboQuant's name implies. Prerequisite: the memory becomes worth caring
+  about — i.e. targeting contexts where the KV cache is the bottleneck.
+- **Fuse rotate + boundary search into one Metal kernel.** Mid effort. Saves
+  most of the ~5%. Worth it only if TurboQuant stays.
 
 ---
 
@@ -162,5 +186,15 @@ implementation:
   "pages touched in last N tokens" to skip prefault when hit.
 - **KV compression beyond 3-bit** via quantile-compander or QJL for the first
   few prompt tokens (which are higher-variance).
-- **FlashAttention-style tiling for long prefill** if `mlx_rs::fast::scaled_dot_product_attention`
-  doesn't already do it (haven't checked the kernel).
+
+---
+
+## Resolved via measurement (not pursued)
+
+- **FlashAttention-style tiling for long prefill.** `mlx_rs::fast::scaled_dot_product_attention`
+  *is* MLX's Metal flash-attention kernel — tiled QK, online softmax, no
+  materialized N×N matrix. Confirmed 2026-04-24 by reading
+  `src/model/gemma4_attention.rs:80-92` (call sites) and verifying the fused
+  kernel receives bf16 K/V directly (no dequant on read path — the
+  `Quantized` cache also stores bf16). Nothing to implement; the win is
+  already banked.

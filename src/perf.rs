@@ -67,9 +67,7 @@ pub struct PerfStats {
     pub gdn_proj_eval: Cell<u64>,     // vestigial (GDN removed) — always 0
     pub moe_routing_eval: Cell<u64>,  // eval(flat_idx) — routing + attn tail
     pub moe_sort_eval: Cell<u64>,     // vestigial (argsort fused) — always 0
-    pub kv_quant_eval: Cell<u64>,     // eval(new_k, new_v) — TurboQuant round-trip
-    pub sdpa_eval: Cell<u64>,         // eval(sdpa_out) — fused flash attention
-    pub layer_eval: Cell<u64>,        // eval(h) total wall time (residual after sub-phase evals)
+    pub layer_eval: Cell<u64>,        // eval(h) total wall time
     pub eval_wait: Cell<u64>,         // eval(h) after async_eval — page fault time
 
     // CPU work between evals
@@ -83,8 +81,6 @@ impl PerfStats {
             gdn_proj_eval: Cell::new(0),
             moe_routing_eval: Cell::new(0),
             moe_sort_eval: Cell::new(0),
-            kv_quant_eval: Cell::new(0),
-            sdpa_eval: Cell::new(0),
             layer_eval: Cell::new(0),
             eval_wait: Cell::new(0),
             extract_experts: Cell::new(0),
@@ -100,8 +96,6 @@ impl PerfStats {
         self.gdn_proj_eval.set(0);
         self.moe_routing_eval.set(0);
         self.moe_sort_eval.set(0);
-        self.kv_quant_eval.set(0);
-        self.sdpa_eval.set(0);
         self.layer_eval.set(0);
         self.eval_wait.set(0);
         self.extract_experts.set(0);
@@ -115,8 +109,6 @@ impl PerfStats {
         let evals_total = self.gdn_proj_eval.get()
             + self.moe_routing_eval.get()
             + self.moe_sort_eval.get()
-            + self.kv_quant_eval.get()
-            + self.sdpa_eval.get()
             + self.layer_eval.get();
         let cpu_total = self.extract_experts.get() + self.routing_cpu.get();
         let total = evals_total + cpu_total;
@@ -135,14 +127,6 @@ impl PerfStats {
         if self.moe_sort_eval.get() > 0 {
             eprintln!("MoE sort eval:         {:>8.1}   {:>6.1}   {:>4.1}%",
                 ms(self.moe_sort_eval.get()), per_tok(self.moe_sort_eval.get()), pct(self.moe_sort_eval.get()));
-        }
-        if self.kv_quant_eval.get() > 0 {
-            eprintln!("KV quant eval:         {:>8.1}   {:>6.1}   {:>4.1}%",
-                ms(self.kv_quant_eval.get()), per_tok(self.kv_quant_eval.get()), pct(self.kv_quant_eval.get()));
-        }
-        if self.sdpa_eval.get() > 0 {
-            eprintln!("SDPA eval:             {:>8.1}   {:>6.1}   {:>4.1}%",
-                ms(self.sdpa_eval.get()), per_tok(self.sdpa_eval.get()), pct(self.sdpa_eval.get()));
         }
         eprintln!("Layer eval:            {:>8.1}   {:>6.1}   {:>4.1}%",
             ms(self.layer_eval.get()), per_tok(self.layer_eval.get()), pct(self.layer_eval.get()));
